@@ -7,7 +7,8 @@ sweep, and eight rounds of the same sweep still miss it 10 percent of the time.
 This tool states that miss probability, refuses to call a run healthy when the
 rounds are too few to support the claim, and counts a probe as passed only when
 the body holds a feature or the bytes of an image. The HTTP status is recorded
-and never decides.
+and never decides. A map service whose capabilities leave out Data cannot be
+queried, so its export is probed for image bytes instead.
 
     python svcsmoke.py --self-test
     python svcsmoke.py URL [URL ...]
@@ -39,6 +40,7 @@ from __future__ import print_function
 import argparse
 import contextlib
 import csv
+import gzip
 import http.client
 import http.server
 import importlib.util
@@ -50,6 +52,7 @@ import random
 import re
 import shutil
 import socket
+import struct
 import sys
 import tempfile
 import threading
@@ -58,6 +61,7 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 
 # =============================================================================
 # CONFIGURATION. Deliberately not flags. Change here, not at the call site.
@@ -98,6 +102,10 @@ DEFAULT_MAX_REQUESTS = 2000
 
 # Seconds between polls when --wait is given.
 DEFAULT_INTERVAL = 10.0
+
+# The largest value --timeout, --wait and --interval accept, in seconds. A
+# larger or non-finite number overflows a socket timeout or never ends.
+MAX_SECONDS = 86400.0
 
 # The environment variable the token is read from. Never a flag, because a
 # flag shows in the process list and in shell history.
@@ -146,6 +154,7 @@ LOOPBACK = ("localhost", "127.0.0.1", "::1")
 _TITLE = re.compile(r"<title[^>]*>\s*(.*?)\s*</title>", re.I | re.S)
 _FAULTY = re.compile(r"^\s*(\d+)\s*/\s*(\d+)\s*$")
 _TOKEN_PARAM = re.compile(r"(?i)(token=)[^&\s\"']+")
+_TOKEN_PARAM_BYTES = re.compile(rb"(?i)(token=)[^&\s\"']+")
 
 # The columns --out writes: one row per probe, or one row for a target that
 # could not be probed.
@@ -221,6 +230,18 @@ def scrub(text, token):
     return text
 
 
+def scrub_body(body, token):
+    """A reply body safe to quote: no token value and no token= parameter.
+
+    This runs on the whole body before any text is cut to a length. A token
+    longer than the cut would otherwise survive as a prefix.
+    """
+    body = _TOKEN_PARAM_BYTES.sub(rb"\1[token]", body)
+    if token:
+        body = body.replace(token.encode("ascii"), b"[token]")
+    return body
+
+
 def describe_body(body):
     """What a body that is not the expected thing looks like, in a line."""
     text = body[:4096].decode("utf-8", "replace")
@@ -233,7 +254,7 @@ def describe_body(body):
 def parse_json(body):
     """(document, None) for a JSON object, else (None, (kind, detail))."""
     try:
-        doc = json.loads(body.decode("utf-8"))
+        doc = json.loads(body.decode("utf-8-sig"))
     except (ValueError, RecursionError):
         return None, (NOT_JSON, "not JSON, " + describe_body(body))
     if not isinstance(doc, dict):
@@ -297,22 +318,24 @@ def judge(service_kind, reply, min_bytes, token):
     problem, so a good body under another status fails too. The status alone
     never passes a probe.
     """
+    body = scrub_body(reply.body, token)
     if reply.error:
         kind, detail = reply.error, reply.detail
     elif service_kind == IMAGE_SERVER:
-        kind, detail = classify_image(reply.ctype, reply.body, min_bytes)
+        kind, detail = classify_image(reply.ctype, body, min_bytes)
     else:
-        kind, detail = classify_features(reply.body)
+        kind, detail = classify_features(body)
     if kind == OK and reply.status != 200:
         kind, detail = HTTP_STATUS, "HTTP %d with a good body" % reply.status
-    return kind, scrub(detail, token), reply.status
+    return kind, tidy(scrub(detail, token), 120), reply.status
 
 
 def judge_root(reply, token):
     """A service root reply -> (document, None) or (None, (kind, detail, status))."""
     if reply.error:
-        return None, (reply.error, scrub(reply.detail, token), reply.status)
-    doc, failure = parse_json(reply.body)
+        return None, (reply.error, tidy(scrub(reply.detail, token), 120),
+                      reply.status)
+    doc, failure = parse_json(scrub_body(reply.body, token))
     if failure:
         return None, (failure[0], scrub(failure[1], token), reply.status)
     if "error" in doc:
@@ -340,9 +363,15 @@ def check_target(url, token):
     name or password in the URL, a query string, or a token sent over plain
     HTTP to a host that is not this machine.
     """
-    parts = urllib.parse.urlsplit(url.strip())
-    shown = scrub(tidy(url, 60), None)
-    # Credentials are refused before the URL is ever quoted in a message.
+    url = url.strip()
+    # No message below quotes a URL that holds a password. A URL typed without
+    # a scheme (user:pass@host/...) has no user name for urlsplit to find, so
+    # any "@" keeps the URL out of the message.
+    shown = "the URL" if "@" in url else scrub(tidy(url, 60), None)
+    if not all(33 <= ord(c) < 127 for c in url):
+        raise ValueError("a URL may hold only printable ASCII characters and "
+                         "no spaces. Percent-encode anything else")
+    parts = urllib.parse.urlsplit(url)
     if parts.username or parts.password:
         raise ValueError("a URL may not carry a user name or password; put "
                          "the token in %s" % TOKEN_ENV)
@@ -360,17 +389,23 @@ def check_target(url, token):
     if token and parts.scheme == "http" and parts.hostname not in LOOPBACK:
         raise ValueError("%s is plain http and %s is set. The token would "
                          "cross the network in the clear" % (shown, TOKEN_ENV))
-    return url.strip().rstrip("/"), kind
+    return url.rstrip("/"), kind
 
 
 class Probe(object):
-    """One request shape: a layer query, or an image export view."""
+    """One request shape: a layer query, or an image export view.
 
-    def __init__(self, name, layer=None, bbox=None, wkid=None):
+    A view is asked of `endpoint`: exportImage on an image service, export on
+    a map service that cannot be queried.
+    """
+
+    def __init__(self, name, layer=None, bbox=None, wkid=None,
+                 endpoint="exportImage"):
         self.name = name
         self.layer = layer
         self.bbox = bbox
         self.wkid = wkid
+        self.endpoint = endpoint
 
 
 def pick_layers(doc, wanted):
@@ -399,8 +434,8 @@ def _number(value):
             and math.isfinite(value))
 
 
-def views_from_root(doc):
-    """(views, reason) from an image service root: the whole extent, then a detail."""
+def views_from_root(doc, endpoint="exportImage"):
+    """(views, reason) from a service root: the whole extent, then a detail."""
     extent = doc.get("extent")
     if not isinstance(extent, dict):
         extent = doc.get("fullExtent")
@@ -426,14 +461,35 @@ def views_from_root(doc):
     for name, reach in (("overview", half), ("detail", half / DETAIL_DIVISOR)):
         views.append(Probe("view " + name, bbox=(cx - reach, cy - reach,
                                                  cx + reach, cy + reach),
-                           wkid=wkid))
+                           wkid=wkid, endpoint=endpoint))
     return views, ""
+
+
+def can_query(doc):
+    """False for a map service whose capabilities leave out Data.
+
+    Esri lists Data as the capability a layer query requires and Map as the
+    one a map export requires. With no capabilities string the layers are
+    queried, as before. Other servers list a map service as "Map,Query", so
+    a missing Data only moves the probe to an export when the root also gives
+    an extent to draw.
+    """
+    capabilities = doc.get("capabilities")
+    if not isinstance(capabilities, str):
+        return True
+    return "data" in [c.strip().lower() for c in capabilities.split(",")]
 
 
 def build_plan(service_kind, doc, wanted):
     """(probes, reason). An empty plan carries the reason nothing can be probed."""
     if service_kind == IMAGE_SERVER:
         return views_from_root(doc)
+    if service_kind == MAP_SERVER and not can_query(doc):
+        # With no extent to draw there is nothing to export, and the layers
+        # are queried as for any other map service.
+        views, _ = views_from_root(doc, "export")
+        if views:
+            return views, ""
     ids = pick_layers(doc, wanted)
     if not ids:
         return [], "the service lists no layer to query"
@@ -448,11 +504,13 @@ def probe_url(base, probe, nonce=None):
                   ("returnGeometry", "false"), ("resultRecordCount", "1"),
                   ("f", "json")]
     else:
-        url = base + "/exportImage"
+        url = base + "/" + probe.endpoint
+        # jpgpng is an exportImage format. Export Map has png.
+        fmt = "jpgpng" if probe.endpoint == "exportImage" else "png"
         params = [("bbox", "%.6f,%.6f,%.6f,%.6f" % probe.bbox),
                   ("bboxSR", str(probe.wkid)), ("imageSR", str(probe.wkid)),
                   ("size", "%d,%d" % (IMAGE_SIDE, IMAGE_SIDE)),
-                  ("format", "jpgpng"), ("f", "image")]
+                  ("format", fmt), ("f", "image")]
     if nonce is not None:
         params.append(("_svcsmoke", str(nonce)))
     return url + "?" + urllib.parse.urlencode(params)
@@ -594,8 +652,8 @@ def describe(results, context):
             number, result.verdict, tier, result.target.url,
             len(result.plan), result.requests))
         if result.root:
-            lines.append("     root: %s, %s" % (result.root[0],
-                                                result.root[1]))
+            lines.append("     root: %s, %s%s" % (
+                result.root[0], result.root[1], status_note(result.root[2])))
         elif not result.plan:
             lines.append("     nothing probed: %s" % result.reason)
         for stat in result.stats:
@@ -629,6 +687,9 @@ def describe(results, context):
                      "nothing about a smaller share." % (rounds,
                                                          context["faulty"],
                                                          miss))
+        if not context["bust"]:
+            lines[-1] += (" Cache busting was off, so a cache in front of the "
+                          "server could have answered repeated requests.")
     return lines
 
 
@@ -667,10 +728,16 @@ def report_rows(results):
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """Refuse every redirect. urllib would send the token header on to
     wherever the Location says, which may be another host. A redirect is
-    reported as a failed probe instead."""
+    reported as a failed probe instead.
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
+    The handlers below stand in for the stock ones, which read the Location
+    header before they decide, and raise ValueError on a malformed one."""
+
+    def http_error_302(self, req, fp, code, msg, headers):
         return None
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_302
+    http_error_308 = http_error_302
 
 
 def _reply(resp, max_body):
@@ -678,9 +745,12 @@ def _reply(resp, max_body):
     status = resp.getcode()
     ctype = resp.headers.get("Content-Type", "")
     if 300 <= status < 400:
-        where = urllib.parse.urlsplit(resp.headers.get("Location", ""))
-        return Reply(status, ctype, b"", REDIRECT,
-                     "redirected to %s" % tidy(where.netloc + where.path, 80))
+        try:
+            where = urllib.parse.urlsplit(resp.headers.get("Location", ""))
+            place = where.netloc + where.path
+        except ValueError:
+            place = "an unreadable address"
+        return Reply(status, ctype, b"", REDIRECT, "redirected to " + place)
     body = resp.read(max_body + 1)
     if len(body) > max_body:
         return Reply(status, ctype, b"", TOO_LARGE,
@@ -721,6 +791,9 @@ def make_fetcher(token, timeout, max_body=MAX_BODY):
             reason = getattr(exc, "reason", exc)
             name = ("timed out" if isinstance(reason, socket.timeout)
                     else type(reason).__name__)
+            number = getattr(reason, "errno", None)
+            if isinstance(number, int) and name != "timed out":
+                name += " (errno %d)" % number
             return Reply(None, "", b"", TRANSPORT, "no response: " + name)
 
     return fetch
@@ -736,7 +809,9 @@ def sample_target(result, rounds, fetch, bust, min_bytes, token, stop_on_fail):
         for probe, stat in zip(result.plan, result.stats):
             reply = fetch(probe_url(base, probe, number if bust else None))
             result.requests += 1
-            stat.add(judge(result.target.kind, reply, min_bytes, token))
+            # A view is judged on image bytes, whatever the service kind.
+            kind = IMAGE_SERVER if probe.layer is None else result.target.kind
+            stat.add(judge(kind, reply, min_bytes, token))
         if stop_on_fail and any(s.failed for s in result.stats):
             break
 
@@ -1303,8 +1378,8 @@ def _assertions(tmp, passed, failed, stubs):
 
     # ---- the report
     ctx = {"rounds": 17, "needed": 17, "fraction": 0.25, "faulty": "1/4",
-           "max_miss": 0.01, "rounds_note": " (the fewest that meet "
-           "--max-miss)"}
+           "max_miss": 0.01, "bust": False, "rounds_note": " (the fewest that "
+           "meet --max-miss)"}
     good, bad, none, down = result(), result(failed=1), result(0), result(
         0, root=(TRANSPORT, "no response: timed out", None))
     for res, word in ((good, PASS), (bad, FAIL), (none, NOTHING),
@@ -1360,8 +1435,11 @@ def _assertions(tmp, passed, failed, stubs):
     secret = "T0K3N-abc123"
     survey([target(stub, "/svc/MapServer")], opts(rounds=1, token=secret),
            make_fetcher(secret, 5))
-    last = stub.requests[-1]
-    check(last[2].get("X-Esri-Authorization") == "Bearer " + secret
+    # Slice, not index: a request that never arrived must read as a failed
+    # check and not as an IndexError that ends the run.
+    last = stub.requests[-1:]
+    check(len(last) == 1
+          and last[0][2].get("X-Esri-Authorization") == "Bearer " + secret
           and all(secret not in str(r[0]) + str(r[1])
                   for r in stub.requests),
           "the token goes in X-Esri-Authorization and never in a URL"
@@ -1404,8 +1482,10 @@ def _assertions(tmp, passed, failed, stubs):
     probe_sock.close()
     reply = make_fetcher(None, 5)("http://127.0.0.1:%d/x/MapServer" % dead)
     check(reply.error == TRANSPORT and reply.status is None
-          and reply.detail == "no response: ConnectionRefusedError",
-          "a refused connection is a TRANSPORT failure with no status")
+          and reply.detail.startswith("no response: ConnectionRefusedError "
+                                      "(errno "),
+          "a refused connection is a TRANSPORT failure with no status and "
+          "the operating system's error number  <-- pinned defect")
     reply = make_fetcher(None, 5)("https://127.0.0.1:%d/x/MapServer"
                                   % stubs[0].port)
     check(reply.error == TRANSPORT and reply.status is None
@@ -1586,6 +1666,18 @@ def _assertions(tmp, passed, failed, stubs):
             ([stub.url("/svc/MapServer"), "--min-image-bytes", "-1"],
              "--min-image-bytes -1"),
             ([stub.url("/svc/MapServer"), "--max-miss", "2"], "--max-miss 2"),
+            ([stub.url("/svc/MapServer"), "--timeout", "nan"],
+             "--timeout nan"),
+            ([stub.url("/svc/MapServer"), "--timeout", "inf"],
+             "--timeout inf"),
+            ([stub.url("/svc/MapServer"), "--timeout", "1e30"],
+             "--timeout 1e30"),
+            ([stub.url("/svc/MapServer"), "--interval", "inf"],
+             "--interval inf"),
+            (["--tiers", "t", "--before", "b", "--wait", "nan"],
+             "--wait nan"),
+            ([stub.url("/svc/MapServer"), "--layers", ""],
+             "--layers with no ids"),
             ([stub.url("/svc/MapServer"), "--faulty", "x"], "--faulty x"),
             ([stub.url("/svc/MapServer"), "--layers", "a,1"], "--layers a,1"),
             (["http://127.0.0.1:1/x/Nope"], "a URL that is not a service")):
@@ -1692,8 +1784,9 @@ def _assertions(tmp, passed, failed, stubs):
           "a failing earlier tier closes the gate after one failed round")
     code, out, err = run(["--tiers", down_path, "--before", "app", "--wait",
                           "0.3", "--interval", "0.05"])
-    check(code == 5 and "still not healthy" in out
-          and "gate closed on attempt 1 (exit 1)" in out,
+    check(code == 5 and "not proven healthy when --wait ran out" in out
+          and "gate closed on attempt 1 (exit 1)" in err
+          and "gate closed" not in out,
           "a gate that stays closed through --wait exits 5")
     recovering = {"n": 0}
 
@@ -1710,8 +1803,8 @@ def _assertions(tmp, passed, failed, stubs):
         handle.write("db: %s\napp: u\n" % flaky_stub.url("/a/MapServer"))
     code, out, err = run(["--tiers", flaky_path, "--before", "app", "--wait",
                           "30", "--interval", "0.05"])
-    check(code == 0 and out.count("gate closed on attempt") == 2
-          and "GATE: OPEN" in out,
+    check(code == 0 and err.count("gate closed on attempt") == 2
+          and "GATE: OPEN" in out and "gate closed" not in out,
           "a tier that comes back during --wait opens the gate")
     code, out, err = run(["--tiers", os.path.join(tmp, "absent.txt"),
                           "--before", "app"])
@@ -1729,6 +1822,223 @@ def _assertions(tmp, passed, failed, stubs):
         check(handle.read().startswith("# dependency order"),
               "and the tiers file was left as it was")
 
+    # ---- audit round 1: each case below was a reproduced defect
+    check("GATE:" not in run([stub.url("/svc/MapServer"), "--rounds", "17"])[1],
+          "a plain run never prints a GATE line, so a script that greps for "
+          "GATE: OPEN cannot read one as an open gate")
+    dflt = _parse([])
+    check(dflt.timeout == 30.0 and dflt.min_image_bytes == 1000
+          and dflt.max_requests == 2000 and dflt.interval == 10.0
+          and dflt.faulty == "1/4" and dflt.max_miss == 0.01
+          and dflt.wait == 0.0 and not dflt.bust_cache,
+          "the defaults in the README flag table are the defaults in the code")
+    nl_stub = serve(pool(1, 0, random.Random(3)))
+    for tail in ("\n", "\r\n"):
+        code, out, err = run([nl_stub.url("/svc/MapServer"), "--rounds",
+                              "17"], token="NLTOKEN123" + tail)
+        seen = nl_stub.requests[-1:]
+        check(code == 0 and err == "" and len(seen) == 1
+              and seen[0][2].get("X-Esri-Authorization")
+              == "Bearer NLTOKEN123",
+              "a token with %r on its end is stripped, sent, and not echoed"
+              "  <-- pinned defect" % tail)
+    for bad_token in ("SECRETab cd", "SECRET\u00e9x", "SECRET\x07x",
+                      "SECRET\nx"):
+        code, out, err = run([nl_stub.url("/svc/MapServer")],
+                             token=bad_token)
+        check(code == 64 and out == "" and "SECRET" not in err
+              and "SVCSMOKE_TOKEN may hold only" in err,
+              "a token with a space, control or non-ASCII character is "
+              "refused without being quoted: %s  <-- pinned defect"
+              % ascii(bad_token[6:]))
+    long_token = "eyJ0b2tlbiI" + "A1b2C3d4E5f6G7h8I9j0" * 12
+    long_csv = os.path.join(tmp, "long.csv")
+    echoes = (
+        ("an error message", {"body": json.dumps({"error": {
+            "code": 498, "message": "Invalid token %s supplied" % long_token
+        }}).encode()}),
+        ("an html page", {"body": ("<html><body>" + "x" * 30 + long_token
+                                   + "</body></html>").encode(),
+                          "ctype": "text/html"}))
+    for what, answer in echoes:
+        echo_stub = serve(lambda path, params, headers, a=answer: {
+            "body": map_root()} if path.endswith("/MapServer") else a)
+        code, out, err = run([echo_stub.url("/svc/MapServer"), "--rounds",
+                              "1", "--out", long_csv, "--apply"],
+                             token=long_token)
+        with open(long_csv, encoding="utf-8") as handle:
+            written = handle.read()
+        check(code == 1 and long_token[:8] not in out + err + written
+              and "[token]" in out + written,
+              "a 231 character token echoed in %s is removed whole, not cut "
+              "to a prefix first  <-- pinned defect" % what)
+    check(scrub_body(b"a SECRET b token=xyz&q=1", "SECRET")
+          == b"a [token] b token=[token]&q=1"
+          and scrub_body(b"plain", None) == b"plain",
+          "scrub_body removes the token value and any token= parameter")
+    kind, detail, status = judge(MAP_SERVER, Reply(
+        302, "", b"", REDIRECT, "redirected to /x/" + "T" * 300), 1, "T" * 300)
+    check(kind == REDIRECT and "TTTTTTTT" not in detail
+          and "[token]" in detail,
+          "a token in a redirect address is removed before it is cut"
+          "  <-- pinned defect")
+    for bad_url in ("alice:hunter2pw@gis.example.com/arcgis/rest/services/A/"
+                    "MapServer", "alice:hunter2pw@gis.example.com:6443/arcgis"
+                    "/rest/services/A/MapServer", "alice:hunter2pw@h/x/Other"):
+        raises(lambda b=bad_url: check_target(b, None),
+               "a URL typed without a scheme but with a password is refused")
+        try:
+            check_target(bad_url, None)
+        except ValueError as exc:
+            check("hunter2pw" not in str(exc),
+                  "and the refusal never repeats the password"
+                  "  <-- pinned defect")
+    for bad_url in ("https://ho st/x/MapServer", "https://h.example/\u00e9/"
+                    "MapServer", "https://h.example/x/Map\tServer"):
+        raises(lambda b=bad_url: check_target(b, None),
+               "a URL with a space, a control or a non-ASCII character is a "
+               "usage error, not a failed service: %r  <-- pinned defect"
+               % ascii(bad_url[8:20]))
+    reply = make_fetcher(None, 5)(serve(lambda path, params, headers: {
+        "status": 302, "headers": {"Location": "http://[::1/x"}}).url("/x"))
+    check(reply.error == REDIRECT
+          and reply.detail == "redirected to an unreadable address",
+          "a malformed Location header is a REDIRECT finding, not a crash"
+          "  <-- pinned defect")
+    check(classify_features(b"\xef\xbb\xbf" + GOOD)[0] == OK,
+          "a JSON body that starts with a byte order mark is read"
+          "  <-- pinned defect")
+    check("(HTTP 200, recorded only)" in "\n".join(describe(
+        [result(0, root=(SERVER_ERROR, "d", 200))], ctx))
+          and "(HTTP" not in "\n".join(describe([down], ctx)),
+          "a failed root line carries the status when there was one"
+          "  <-- pinned defect")
+    check("Cache busting was off" in "\n".join(describe([good], ctx))
+          and "Cache busting" not in "\n".join(
+              describe([good], dict(ctx, bust=True))),
+          "a PASS says when the repeated requests were not cache-busted"
+          "  <-- pinned defect")
+    code, out, err = run([stub.url("/svc/MapServer"), "--rounds", "17",
+                          "--bust-cache"])
+    check(code == 0 and "VERDICT: PASS" in out
+          and "Cache busting" not in out,
+          "a run with --bust-cache does not carry the cache note")
+    code, calls, said = gate_of([1], 0.5, 1.0)
+    check(code == 5 and len(calls) == 1,
+          "a --wait shorter than --interval is one look, then exit 5")
+
+    # A map service published without the Data capability draws maps and
+    # refuses every layer query. It is probed through its export instead.
+    check(can_query({"capabilities": "Map,Query,Data"})
+          and can_query({"capabilities": " map , DATA "})
+          and can_query({}) and can_query({"capabilities": 5})
+          and not can_query({"capabilities": "Map"})
+          and not can_query({"capabilities": "Map,Query"}),
+          "only a capabilities string without Data stops the layer queries")
+
+    def drawn_only(path, params, headers):
+        if path.endswith("/MapServer"):
+            return {"body": json.dumps({
+                "capabilities": "Map", "fullExtent": EXTENT,
+                "layers": [{"id": 0, "subLayerIds": None}]}).encode()}
+        return {"body": PNG, "ctype": "image/png"}
+    stub = serve(drawn_only)
+    res = survey([target(stub, "/draw/MapServer")], opts(rounds=2),
+                 make_fetcher(None, 5))[0]
+    asked = [r for r in stub.requests if r[0].endswith("/export")]
+    check(res.verdict == PASS and res.requests == 5 and len(asked) == 4
+          and not any(r[0].endswith("query") for r in stub.requests)
+          and all(r[1]["format"] == "png" and r[1]["f"] == "image"
+                  and r[1]["size"] == "400,400" for r in asked),
+          "a map service without Data is probed through export as image bytes"
+          ", never through a layer query  <-- pinned defect")
+    check([p.name for p in build_plan(MAP_SERVER, {
+        "capabilities": "Map,Query", "layers": [{"id": 4}]}, [])[0]]
+          == ["layer 4"],
+          "a map service without Data and without an extent is still queried"
+          ", as before  <-- pinned defect")
+
+    # A gate that has polled must still print nothing to stdout before a
+    # usage error.
+    shrink = {"n": 0}
+
+    def shrinking(path, params, headers):
+        shrink["n"] += 1
+        if shrink["n"] == 1:
+            return {"status": 503, "body": HTML, "ctype": "text/html"}
+        return {"body": map_root(tuple((i, None) for i in range(50)))}
+    shrink_stub = serve(shrinking)
+    shrink_path = os.path.join(tmp, "shrink.txt")
+    with open(shrink_path, "w", encoding="utf-8") as handle:
+        handle.write("db: %s\napp: u\n" % shrink_stub.url("/a/MapServer"))
+    code, out, err = run(["--tiers", shrink_path, "--before", "app",
+                          "--wait", "30", "--interval", "0.05",
+                          "--max-requests", "100"])
+    check(code == 64 and out == "" and "gate closed on attempt 1" in err
+          and "--max-requests" in err,
+          "a usage error after a gate has polled still prints nothing to "
+          "stdout  <-- pinned defect")
+
+    link_path = os.path.join(tmp, "tiers-link.txt")
+    with contextlib.suppress(OSError):
+        os.link(tier_path, link_path)
+    # Where the file system cannot link, link_path is a new file and the run
+    # is an ordinary one, so the check holds on any host.
+    code, out, err = run(["--tiers", tier_path, "--before", "app",
+                          "--out", link_path, "--apply"])
+    check(not _same_file(tier_path, link_path)
+          or (code == 64 and "also the --tiers file" in err),
+          "--out may not be a hard link to the tiers file"
+          "  <-- pinned defect")
+    code, out, err = run(["--tiers", tier_path, "--before", "app", "--out",
+                          os.path.join(tmp, "no", "dir", "r.csv"), "--apply"])
+    check(code == 2 and "GATE: OPEN" not in out
+          and "GATE: CLOSED. Do not restart 'app': the report could not be "
+          "written." in out and "could not write" in err,
+          "a gate whose report cannot be written is closed, never OPEN, and "
+          "exits 2  <-- pinned defect")
+
+    # ---- cases the README Limits section states, so each one is exercised
+    check(classify_features(gzip.compress(GOOD))[0] == NOT_JSON,
+          "a body gzip-compressed by a proxy is NOT_JSON, so the service "
+          "reads as failed")
+    check(classify_features(b'{"features": [null]}')[0] == OK
+          and classify_features(b'{"features": [{}]}')[0] == OK,
+          "a features list passes whatever its entries hold")
+    check(build_plan(MAP_SERVER, {"tables": [{"id": 0, "name": "t"}]}, [])
+          == ([], "the service lists no layer to query"),
+          "a service whose root lists only stand-alone tables probes nothing")
+
+    class Bare(object):
+        """A response with no Content-Length header and a short body."""
+        headers = {"Content-Type": "image/png"}
+
+        def getcode(self):
+            return 200
+
+        def read(self, size):
+            return PNG[:100]
+    short = _reply(Bare(), MAX_BODY)
+    check(short.error is None and classify_image(
+        short.ctype, short.body, 0)[0] == OK,
+          "without a Content-Length a cut-short image cannot be told from a "
+          "whole one")
+
+    def blank_png():
+        def chunk(kind, data):
+            return (struct.pack(">I", len(data)) + kind + data
+                    + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff))
+        rows = (b"\x00" + b"\x00" * (4 * IMAGE_SIDE)) * IMAGE_SIDE
+        return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(
+            ">IIBBBBB", IMAGE_SIDE, IMAGE_SIDE, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+    blank = blank_png()
+    check(len(blank) < DEFAULT_MIN_IMAGE_BYTES
+          and classify_image("image/png", blank, DEFAULT_MIN_IMAGE_BYTES)[0]
+          == SMALL_IMAGE,
+          "a transparent blank 400 by 400 PNG is under the default minimum, "
+          "so an empty detail view fails")
+
     # ---- the harness, the crash exit and the import
     _restore_env("SVCSMOKE_SELFTEST_PROBE", "kept")
     kept = os.environ.get("SVCSMOKE_SELFTEST_PROBE")
@@ -1736,7 +2046,7 @@ def _assertions(tmp, passed, failed, stubs):
     check(kept == "kept" and "SVCSMOKE_SELFTEST_PROBE" not in os.environ,
           "the environment is put back as it was, set or unset")
     table = globals()
-    original = table["survey"]
+    original = original_survey = table["survey"]
 
     def explode(*args, **kwargs):
         raise RuntimeError("boom")
@@ -1758,6 +2068,19 @@ def _assertions(tmp, passed, failed, stubs):
     check(code == 7,
           "main returns the exit status of --self-test, so a red self-test "
           "fails CI  <-- pinned defect")
+    for crash in (RuntimeError, ValueError):
+        def leak(*args, **kwargs):
+            raise crash("went wrong near SECRETXYZ789")
+        table["survey"] = leak
+        try:
+            code, out, err = run([stub.url("/svc/MapServer")],
+                                 token="SECRETXYZ789")
+        finally:
+            table["survey"] = original_survey
+        check(code in (64, 70) and "SECRETXYZ789" not in out + err
+              and "[token]" in err,
+              "%s text that holds the token is scrubbed before it is "
+              "printed  <-- pinned defect" % crash.__name__)
 
     quiet = sys.stdout
     sys.stdout = io.StringIO()
@@ -1841,7 +2164,8 @@ def _parse(argv):
     ap.add_argument("--layers",
                     help="comma-separated layer ids to query instead of "
                          "every layer. Use it to leave out a layer that is "
-                         "meant to be empty. Ignored for an ImageServer.")
+                         "meant to be empty. Ignored for an ImageServer and "
+                         "for a map service probed through its export.")
     ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
                     help="seconds to wait for one response (default %g)"
                          % DEFAULT_TIMEOUT)
@@ -1889,8 +2213,23 @@ def _layer_ids(text):
 
 
 def _same_file(a, b):
-    return os.path.normcase(os.path.realpath(a)) == os.path.normcase(
-        os.path.realpath(b))
+    """True when two paths name one file, through a link or an alias."""
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        # One of them does not exist yet, so compare the spelling.
+        return os.path.normcase(os.path.realpath(a)) == os.path.normcase(
+            os.path.realpath(b))
+
+
+def _env_token():
+    """The token from the environment, without a trailing newline, or None."""
+    return (os.environ.get(TOKEN_ENV) or "").strip() or None
+
+
+def _progress(line):
+    """Gate progress goes to stderr, so stdout holds only the report."""
+    print(line, file=sys.stderr)
 
 
 def _tolerate_odd_characters():
@@ -1913,10 +2252,11 @@ def main(argv=None):
     try:
         return _run(argv)
     except Exception as exc:
-        print("error: unexpected %s: %s. This is a fault in the tool, not a "
-              "finding about the services." % (type(exc).__name__, exc),
-              file=sys.stderr)
-        traceback.print_exc()
+        token = _env_token()
+        print(scrub("error: unexpected %s: %s. This is a fault in the tool, "
+                    "not a finding about the services."
+                    % (type(exc).__name__, exc), token), file=sys.stderr)
+        print(scrub(traceback.format_exc(), token), file=sys.stderr)
         return 70
 
 
@@ -1942,6 +2282,10 @@ def _run(argv):
                       "a server.")
     if args.wait and not gate:
         return _usage("--wait needs --tiers and --before.")
+    if not all(math.isfinite(v) and v <= MAX_SECONDS
+               for v in (args.wait, args.interval, args.timeout)):
+        return _usage("--wait, --interval and --timeout must be numbers of "
+                      "seconds, at most %d." % MAX_SECONDS)
     if args.wait < 0 or args.interval <= 0 or args.timeout <= 0:
         return _usage("--wait cannot be negative, and --interval and "
                       "--timeout must be above zero.")
@@ -1956,11 +2300,15 @@ def _run(argv):
         return _usage("--out %s is also the --tiers file. Name a new file."
                       % args.out)
 
-    token = os.environ.get(TOKEN_ENV) or None
+    token = _env_token()
+    if token and not all(33 <= ord(c) < 127 for c in token):
+        # The value is not quoted: it is the secret.
+        return _usage("%s may hold only printable ASCII characters and no "
+                      "spaces." % TOKEN_ENV)
     try:
         fraction = parse_faulty(args.faulty)
         needed = rounds_needed(fraction, args.max_miss)
-        layers = _layer_ids(args.layers) if args.layers else []
+        layers = _layer_ids(args.layers) if args.layers is not None else []
     except ValueError as exc:
         return _usage(str(exc))
 
@@ -1987,7 +2335,7 @@ def _run(argv):
                "max_requests": args.max_requests, "token": token}
     context = {"rounds": rounds, "needed": needed, "fraction": fraction,
                "faulty": args.faulty.replace(" ", ""),
-               "max_miss": args.max_miss,
+               "max_miss": args.max_miss, "bust": args.bust_cache,
                "rounds_note": (" (set by --rounds)" if args.rounds else
                                " (the fewest that meet --max-miss)")}
     fetch = make_fetcher(token, args.timeout)
@@ -1996,27 +2344,33 @@ def _run(argv):
         if gate:
             results, code = run_gate(
                 lambda: survey(targets, options, fetch, True), args.wait,
-                args.interval, time.monotonic, time.sleep, print)
+                args.interval, time.monotonic, time.sleep, _progress)
         else:
             results = survey(targets, options, fetch)
             code = exit_code(results)
     except ValueError as exc:
-        return _usage(str(exc))
+        return _usage(scrub(str(exc), token))
 
+    # The report is written before the gate line, so a gate never reads OPEN
+    # when the evidence for it could not be saved.
+    failure = None
+    if args.out and args.apply:
+        # A traceback here would exit 1, the code for "a service failed".
+        try:
+            write_report(args.out, results)
+        except (IOError, OSError, csv.Error) as exc:
+            failure = exc
     for line in describe(results, context):
         print(line)
     if gate:
-        print(_gate_line(args.before, code))
+        print(_gate_line(args.before, 2 if failure else code))
+    if failure:
+        print("error: could not write %s: %s" % (args.out, failure),
+              file=sys.stderr)
+        return 2
 
     if args.out:
         if args.apply:
-            # A traceback here would exit 1, the code for "a service failed".
-            try:
-                write_report(args.out, results)
-            except (IOError, OSError, csv.Error) as exc:
-                print("error: could not write %s: %s" % (args.out, exc),
-                      file=sys.stderr)
-                return 2
             print("\nwrote %s" % args.out)
         else:
             print("\nCheck only. %s was not written. Re-run with --apply."
@@ -2028,8 +2382,11 @@ def _gate_line(name, code):
     """The one line a restart script greps for."""
     if code == 0:
         return "GATE: OPEN. Tier '%s' may restart." % name
+    if code == 2:
+        return ("GATE: CLOSED. Do not restart '%s': the report could not be "
+                "written." % name)
     if code == 5:
-        return ("GATE: CLOSED. The tiers before '%s' were still not healthy "
+        return ("GATE: CLOSED. The tiers before '%s' were not proven healthy "
                 "when --wait ran out." % name)
     return ("GATE: CLOSED. Do not restart '%s' yet; the tiers before it are "
             "not proven healthy." % name)

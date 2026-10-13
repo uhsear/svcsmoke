@@ -4,11 +4,11 @@ Sample each ArcGIS Server service repeatedly and state how likely the sampling w
 fault. Pass a service only when it returned a feature or the bytes of an image.
 
 A service reads STARTED. Nothing alerts. For 12 to 14 hours every `exportImage` call on an
-imagery service fails, and the maps that sit on top of it show a blank background. The service
-description answers. The admin page is green. Everything a check can read says the service is up,
-because the status says what state the service is in, and it does not say whether a request
-returns anything. Esri's service status operation returns two fields, `configuredState` and
-`realTimeState`, and neither one is the result of an export ([Service status][status]).
+imagery service fails. The service description answers. The admin page is green. Everything a
+check can read says the service is up, because the status says what state the service is in, and
+it does not say whether a request returns anything. Esri's service status operation returns two
+fields, `configuredState` and `realTimeState`, and neither one is the result of an export
+([Service status][status]).
 
 The first fix is a sweep: ask every layer once, and run the sweep after each restart. It finds
 nothing. The fault sits on 2 of the 8 instances in the pool, and one request is answered by one
@@ -25,7 +25,7 @@ The third trap is the pass condition. Esri says a request that completes with HT
 "has been processed", and that the client needs "to check for the presence of an error property"
 in the body. A check that reads the status passes an error. So this tool passes a probe only on
 evidence: a feature in the body of a query, or image bytes in the body of an export. The status is
-recorded in every failure line and it never decides.
+recorded on the first failure of each probe and on a failed service root, and it never decides.
 
 ```
 $ python svcsmoke.py --self-test
@@ -47,15 +47,17 @@ PASS  a clean run with too few rounds is UNDERSAMPLED, not a pass  <-- pinned de
 ...
 PASS  a prefix of a flag is refused, not read as the flag: --ap  <-- pinned defect
 PASS  a token the server echoes back is removed from the screen and from the report  <-- pinned defect
+PASS  a 231 character token echoed in an error message is removed whole, not cut to a prefix first  <-- pinned defect
+PASS  a map service without Data is probed through export as image bytes, never through a layer query  <-- pinned defect
 PASS  and it never probes the tier being restarted or any tier after it  <-- pinned defect
 PASS  a gate does not open on an undersampled pass  <-- pinned defect
 ...
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-181 assertions, 0 failed
+227 assertions, 0 failed
 ```
 
-The full run prints all 181 assertions. Each `...` line above is where this block is cut.
+The full run prints all 227 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -66,28 +68,31 @@ thing they do not document, and it does not replace any of them.
   ArcGIS Server site is able to receive and process requests"
   ([Health Check][health]). It is the right probe for a load balancer. It speaks for the machine,
   and it cannot say that a given service draws an image.
-- **ArcGIS Monitor.** Esri's monitoring product keeps history, raises alerts and calculates
-  availability from critical alerts ([ArcGIS Monitor 10.8, data analysis][monitor]). Its Web
-  category lists Http and Url checks with a "Response Time" counter and a "Response Code"
-  counter. I found no counter that reads the body, and nothing about repeated requests or a miss
-  probability. Use it for the history and the alerts. Use this tool for the proof that a service
-  returned data.
-- **con terra Service Monitor.** A commercial monitor with job types for MapServer, FeatureServer
-  and ImageServer. Each check "is based on a request to the service and the subsequent
+- **ArcGIS Monitor.** Esri's monitoring product raises alerts and calculates availability from
+  critical alerts ([ArcGIS Monitor 10.8, data analysis][monitor]). Its Web category lists Http and
+  Url checks with a "Response Time" counter and a "Response Code" counter. I found no counter
+  that reads the body, and nothing about repeated requests or a miss probability. That page does
+  not say whether Monitor stores history, so I make no claim about it. Use Monitor for the alerts.
+  Use this tool for the proof that a service returned data.
+- **con terra Service Monitor.** A commercial monitor that lists MapServer, FeatureServer and
+  ImageServer among its service types. Each check "is based on a request to the service and the subsequent
   verification of the response" ([Registering a new service][conterra]). It tests reachability,
   status code, an optional response time and the content. That is the same idea as this tool's
   pass condition. The page I read does not describe repeating the request or stating a miss
   probability.
-- **Open-source scripts.** `gh search repos` on 2026-10-13 found no repository named `svcsmoke`.
-  Searches on `arcgis health`, `arcgis monitor`, `arcgis-server monitoring` and
-  `arcgis service check` found several. Among them are
+- **Open-source scripts.** On 2026-10-13, before this repository was public, `gh search repos`
+  found no repository named `svcsmoke`. That search now returns this repository, so it cannot be
+  repeated. The queries `arcgis health`, `arcgis monitor` and `arcgis service check` returned
+  results, and the repositories below exist (I confirmed each with `gh api` on 2026-10-13). Among
+  them are
   [diaznoed/Service-Check-Scripts](https://github.com/diaznoed/Service-Check-Scripts) (monitors
   the health of an ArcGIS Server, validates a datastore, checks for stopped services),
   [OsmanKozen/python-arcgis-service-check](https://github.com/OsmanKozen/python-arcgis-service-check),
   [WestonSF/ArcGISServerMonitor](https://github.com/WestonSF/ArcGISServerMonitor) and
   [kapitigis/ArcGISMonitoringDashboard](https://github.com/kapitigis/ArcGISMonitoringDashboard).
   I read the README of the first and the last, and only the descriptions of the others. I did not
-  run any of them. That search shows only that the search found nothing else.
+  run any of them. Search results change from day to day, so this list shows what I found and is
+  not a survey.
 
 What this tool adds is narrow. The number of rounds comes from a stated miss probability, and the
 tool prints that probability. A run with too few rounds is not a pass. A probe passes on
@@ -104,9 +109,10 @@ git clone https://github.com/uhsear/svcsmoke.git
 ```
 
 The self-test starts small HTTP servers on `127.0.0.1` and sends them requests. It needs no
-network and no credentials. It takes about 10 to 15 seconds, because a few cases wait on a
-timeout. It prints the same 181 assertions on Windows (Python 3.13.2), on Python 3.9.25 and
-on Ubuntu (Python 3.12.3). All three outputs are identical line for line.
+network and no credentials. It takes about 10 seconds on Windows (Python 3.13) and 4 seconds on
+Linux (Python 3.12), because a few cases wait on a timeout. It prints the same 227
+assertions on Windows (Python 3.13.2), on Python 3.9.25 and on Ubuntu (Python 3.12.3). All three
+outputs are identical line for line, apart from the line endings.
 `coverage run --branch svcsmoke.py --self-test` reports 100 percent of lines and branches.
 
 ## Usage
@@ -131,15 +137,15 @@ python svcsmoke.py --tiers tiers.txt --before app --wait 600
 | `--faulty` | `1/4` | The smallest share of instances with a fault that you want to catch, as K/M. `2/8` is the same share. |
 | `--max-miss` | `0.01` | The largest chance that a run passes when that share is faulty. |
 | `--rounds` | the fewest that meet `--max-miss` | Rounds per probe. A smaller number ends in UNDERSAMPLED. |
-| `--layers` | every layer that is not a group | Comma-separated layer ids to query. Use it to leave out a layer that is meant to be empty. An ImageServer ignores it. |
-| `--timeout` | `30` | Seconds to wait for one response. |
+| `--layers` | every layer that is not a group | Comma-separated layer ids to query. Use it to leave out a layer that is meant to be empty. An ImageServer, and a map service probed through its export, ignore it. An empty value is a usage error. |
+| `--timeout` | `30` | Seconds to wait for one response. At most 86400. |
 | `--min-image-bytes` | `1000` | An image smaller than this counts as blank. A guess; see Limits. |
-| `--bust-cache` | off | Add a different throwaway parameter to each round. |
+| `--bust-cache` | off | Add a different throwaway parameter to each round. Without it a PASS says that no cache was ruled out. |
 | `--max-requests` | `2000` | Refuse a plan larger than this, before sending any sample. |
 | `--tiers` | none | A file of tiers in dependency order. Needs `--before`. |
 | `--before` | none | The tier about to restart. The gate opens only when every tier above it passes. |
-| `--wait` | `0` | Poll the gate for up to this many seconds. |
-| `--interval` | `10` | Seconds between polls. |
+| `--wait` | `0` | Poll the gate for up to this many seconds. At most 86400. |
+| `--interval` | `10` | Seconds between polls. At most 86400. |
 | `--out` | off | Path for the report CSV. Needs `--apply` to be written. |
 | `--apply` | off | Write `--out`. Without it nothing is written. |
 | `--self-test` | off | Run the assertions and exit. Other flags are ignored. |
@@ -175,7 +181,7 @@ Exit codes:
 | 3 | Nothing failed, but too few rounds ran to call the service healthy (UNDERSAMPLED). |
 | 4 | Nothing was probed: a service listed no layer or no usable extent. |
 | 5 | The gate was still closed when `--wait` ran out. |
-| 64 | Usage error. Nothing is printed to stdout. |
+| 64 | Usage error. Nothing is printed to stdout. The gate's "gate closed" progress lines go to stderr, so this holds after a gate has polled. |
 | 70 | An unexpected crash. This is a fault in the tool, never a finding. |
 
 When targets disagree, the worst wins in this order: 1, then 4, then 3.
@@ -223,7 +229,9 @@ $ echo $?
 documentation that says how a request is assigned to an instance. A dispatcher that rotates through
 the instances needs fewer rounds than the table says. A dispatcher that sends one client to the
 same instance every time makes repeated sampling from one client prove nothing. The printed
-probability is exact under the model and only as good as the model.
+probability is exact under the model and only as good as the model. The model also takes a bad
+instance to fail every request it answers. A fault that fails only some of the requests on a bad
+instance needs more rounds than the table gives.
 
 Ask for fewer rounds than the limit needs and the tool says so:
 
@@ -268,9 +276,10 @@ property and a `features` array that holds at least one feature. A count alone d
 because a count says a table has rows and not that a feature reads. A layer that is empty on
 purpose fails; leave it out with `--layers`.
 
-Esri says `resultRecordCount` "only applies if `supportsPagination` is `true`". A layer without
-pagination ignores it and returns up to its `maxRecordCount` features for each probe. A body over
-16 MB fails with the kind `TOO_LARGE`.
+Esri says `resultRecordCount` "only applies if `supportsPagination` is `true`". I infer that a
+layer without pagination ignores it and returns up to its `maxRecordCount` features for each
+probe. Esri does not say so, and no stub here exercises it. A body over 16 MB fails with the kind
+`TOO_LARGE`.
 
 Group layers hold no rows, so the tool skips any layer with sub-layers. It reads the layer list
 from the service root ([Map Service][mapservice]). If the root lists no layer to query, the target
@@ -287,6 +296,31 @@ VERDICT: NOTHING PROBED. At least one target had no layer or view to ask, so a c
 $ echo $?
 4
 ```
+
+**A map service without the Data capability.** Esri lists `Data` as the capability that Query
+(Map Service/Layer) requires, and `Map` as the capability that Export Map requires ([Query (Map
+Service/Layer)][querymap], [Export Map][exportmap]). By those pages, a map service published with
+`Map` alone draws maps and should refuse every layer query. A layer probe would call it failed. So when the root's
+`capabilities` string leaves out `Data` and the root has an extent, the tool asks `export` for the
+same two views as for an ImageServer (`format=png`, because `jpgpng` is an `exportImage` format) and
+judges them on image bytes. The root lists one layer here, so 2 probes means the two views:
+
+```
+$ python svcsmoke.py http://127.0.0.1:8809/arcgis/rest/services/Draw/MapServer
+svcsmoke: 1 target(s), 17 round(s) per probe (the fewest that meet --max-miss)
+sampling: 17 round(s) miss a fault on 1/4 of the instances with probability 0.0075 (limit 0.0100), if each request lands on a random instance
+1. PASS         http://127.0.0.1:8809/arcgis/rest/services/Draw/MapServer  2 probe(s), 35 request(s)
+
+VERDICT: PASS. Every probe returned a feature or image bytes on all 17 round(s). That bounds the chance of missing a fault on 1/4 of the instances at 0.0075. It says nothing about a smaller share. Cache busting was off, so a cache in front of the server could have answered repeated requests.
+$ echo $?
+0
+```
+
+The self-test checks the requests that this sends and that no layer query is sent. It cannot
+check Esri's own error text for a missing `Data` capability, which I did not verify. The stub
+answers with an invented error body. Another server may list a map service as `Map,Query`, as
+restfake does, so the tool switches to `export` only when the root also gives an extent. With no
+extent it queries the layers as for any other map service.
 
 **An ImageServer.** The tool asks `exportImage` for a 400 by 400 image in two views. One view is
 the whole extent of the service. The other is a window 1/100 as wide at its centre, so a fault
@@ -316,16 +350,19 @@ than 200 "indicates that there has been a problem"
 ([Error handling with sync operations][errors]). The status never passes a probe by itself.
 
 **Other failures.** A refused connection, a timeout, a hang-up and a body shorter than its
-`Content-Length` are `TRANSPORT`. A redirect is `REDIRECT` and is not followed. An HTML page where
-JSON was expected is `NOT_JSON`. A JSON `error` property is `SERVER_ERROR`, and the report quotes
-its message.
+`Content-Length` are `TRANSPORT`, and the line gives the exception name and the operating system's
+error number. The number differs between systems, for example 10061 on Windows and 111 on Linux
+for a refused connection. A redirect is `REDIRECT` and is not followed, even when its `Location`
+header is malformed. An HTML page where JSON was expected is `NOT_JSON`. A JSON `error` property
+is `SERVER_ERROR`, and the report quotes its message. A JSON body that starts with a byte order
+mark is read as JSON.
 
 ```
 $ python svcsmoke.py http://127.0.0.1:1/arcgis/rest/services/Gone/MapServer --rounds 1
 svcsmoke: 1 target(s), 1 round(s) per probe (set by --rounds)
 sampling: 1 round(s) miss a fault on 1/4 of the instances with probability 0.7500 (limit 0.0100), if each request lands on a random instance
 1. FAIL         http://127.0.0.1:1/arcgis/rest/services/Gone/MapServer  0 probe(s), 1 request(s)
-     root: TRANSPORT, no response: ConnectionRefusedError
+     root: TRANSPORT, no response: ConnectionRefusedError (errno 10061)
 
 VERDICT: FAILED. 1 target(s) returned no feature or image on at least one request. They are not healthy, whatever their state says.
 $ echo $?
@@ -346,7 +383,7 @@ $ python svcsmoke.py http://127.0.0.1:8806/arcgis/rest/services/Secure/MapServer
 svcsmoke: 1 target(s), 17 round(s) per probe (the fewest that meet --max-miss)
 sampling: 17 round(s) miss a fault on 1/4 of the instances with probability 0.0075 (limit 0.0100), if each request lands on a random instance
 1. FAIL         http://127.0.0.1:8806/arcgis/rest/services/Secure/MapServer  0 probe(s), 1 request(s)
-     root: SERVER_ERROR, error property: Token Required (code 499)
+     root: SERVER_ERROR, error property: Token Required (code 499) (HTTP 200, recorded only)
 
 VERDICT: FAILED. 1 target(s) returned no feature or image on at least one request. They are not healthy, whatever their state says.
 $ echo $?
@@ -362,15 +399,18 @@ svcsmoke: 1 target(s), 17 round(s) per probe (the fewest that meet --max-miss)
 sampling: 17 round(s) miss a fault on 1/4 of the instances with probability 0.0075 (limit 0.0100), if each request lands on a random instance
 1. PASS         http://127.0.0.1:8806/arcgis/rest/services/Secure/MapServer  2 probe(s), 35 request(s)
 
-VERDICT: PASS. Every probe returned a feature or image bytes on all 17 round(s). That bounds the chance of missing a fault on 1/4 of the instances at 0.0075. It says nothing about a smaller share.
+VERDICT: PASS. Every probe returned a feature or image bytes on all 17 round(s). That bounds the chance of missing a fault on 1/4 of the instances at 0.0075. It says nothing about a smaller share. Cache busting was off, so a cache in front of the server could have answered repeated requests.
 $ echo $?
 0
 ```
 
 The tool takes these steps so that the token reaches the server and nobody else:
 
-- A URL may carry no user name, password, query string or fragment. The refusal does not repeat
-  what was in the URL.
+- A URL may carry no user name, password, query string or fragment. A URL with a space, a control
+  character or a non-ASCII character is refused too, and you percent-encode it. The refusal for a
+  credential, a query string or a bad character does not quote the URL. Other refusals quote at
+  most its first 60 characters, with any `token=` value hidden. A URL that holds an `@` is never
+  quoted, so `user:password@host/...` typed without a scheme does not leak the password.
 - With a token set, a plain `http` URL to a host other than this machine is refused, because the
   token would cross the network in the clear.
 - Redirects are never followed, so the header cannot be sent on to the host that `Location`
@@ -379,8 +419,13 @@ The tool takes these steps so that the token reaches the server and nobody else:
   gives as the way to disable a detected proxy ([urllib.request][urllib]). The self-test sets
   `http_proxy` to a dead port and checks that the request still arrives.
 - The token value and any `token=` parameter are removed from every line the tool prints and
-  from the report. The self-test has a server that echoes the token back in its error message,
-  and greps the screen and the report for it.
+  from the report. The tool removes them from the whole reply body before it cuts the text to a
+  length, so a token longer than the cut does not survive as a prefix. The self-test has servers
+  that echo a 231 character token back in an error message and in an HTML page, and greps the
+  screen and the report for it. An unexpected error and a usage error are scrubbed the same way.
+- A trailing newline or carriage return on the token, as from a token file, is stripped. A token
+  with a space, a control character or a non-ASCII character is refused at the start, and the
+  message does not quote it.
 
 ## The ordered-restart gate
 
@@ -408,7 +453,7 @@ svcsmoke: 1 target(s), 17 round(s) per probe (the fewest that meet --max-miss)
 sampling: 17 round(s) miss a fault on 1/4 of the instances with probability 0.0075 (limit 0.0100), if each request lands on a random instance
 1. PASS         [db] http://127.0.0.1:8808/arcgis/rest/services/Healthy/MapServer  2 probe(s), 35 request(s)
 
-VERDICT: PASS. Every probe returned a feature or image bytes on all 17 round(s). That bounds the chance of missing a fault on 1/4 of the instances at 0.0075. It says nothing about a smaller share.
+VERDICT: PASS. Every probe returned a feature or image bytes on all 17 round(s). That bounds the chance of missing a fault on 1/4 of the instances at 0.0075. It says nothing about a smaller share. Cache busting was off, so a cache in front of the server could have answered repeated requests.
 GATE: OPEN. Tier 'app' may restart.
 $ echo $?
 0
@@ -456,18 +501,43 @@ svcsmoke: 1 target(s), 17 round(s) per probe (the fewest that meet --max-miss)
 sampling: 17 round(s) miss a fault on 1/4 of the instances with probability 0.0075 (limit 0.0100), if each request lands on a random instance
 1. PASS         [db] http://127.0.0.1:8809/arcgis/rest/services/Flaky/MapServer  2 probe(s), 35 request(s)
 
-VERDICT: PASS. Every probe returned a feature or image bytes on all 17 round(s). That bounds the chance of missing a fault on 1/4 of the instances at 0.0075. It says nothing about a smaller share.
+VERDICT: PASS. Every probe returned a feature or image bytes on all 17 round(s). That bounds the chance of missing a fault on 1/4 of the instances at 0.0075. It says nothing about a smaller share. Cache busting was off, so a cache in front of the server could have answered repeated requests.
 GATE: OPEN. Tier 'app' may restart.
 $ echo $?
 0
 ```
 
-If the gate is still closed when the wait runs out, the exit code is 5. A restart script can use
-it as a guard:
+If the gate is still closed when the wait runs out, the exit code is 5, and the gate line says
+the tiers were not proven healthy. A `--wait` shorter than `--interval` is one look and then
+exit 5, because there is no time left for a second poll. A restart script can use the exit code
+as a guard:
 
 ```
 python svcsmoke.py --tiers tiers.txt --before app --wait 900 && restart-app
 ```
+
+The progress lines ("gate closed on attempt N") go to stderr. The report and the `GATE:` line go
+to stdout. A run without `--tiers` never prints a `GATE:` line.
+
+When `--out` and `--apply` are given and the report cannot be written, the gate is closed even
+if every tier passed, and the exit code is 2. A gate must not read OPEN when the evidence for it
+was lost:
+
+```
+$ python svcsmoke.py --tiers tiers3.txt --before app --out nodir/r.csv --apply
+error: could not write nodir/r.csv: [Errno 2] No such file or directory: 'nodir/r.csv'
+svcsmoke: 1 target(s), 17 round(s) per probe (the fewest that meet --max-miss)
+sampling: 17 round(s) miss a fault on 1/4 of the instances with probability 0.0075 (limit 0.0100), if each request lands on a random instance
+1. PASS         [db] http://127.0.0.1:8809/arcgis/rest/services/Healthy/MapServer  2 probe(s), 35 request(s)
+
+VERDICT: PASS. Every probe returned a feature or image bytes on all 17 round(s). That bounds the chance of missing a fault on 1/4 of the instances at 0.0075. It says nothing about a smaller share. Cache busting was off, so a cache in front of the server could have answered repeated requests.
+GATE: CLOSED. Do not restart 'app': the report could not be written.
+$ echo $?
+2
+```
+
+(The `error:` line comes first only because stderr is not buffered. The same run on a terminal
+shows it last.)
 
 This tool restarts nothing. It reads and it reports.
 
@@ -481,7 +551,7 @@ svcsmoke: 1 target(s), 17 round(s) per probe (the fewest that meet --max-miss)
 sampling: 17 round(s) miss a fault on 1/4 of the instances with probability 0.0075 (limit 0.0100), if each request lands on a random instance
 1. PASS         http://127.0.0.1:8807/arcgis/rest/services/Healthy/MapServer  2 probe(s), 35 request(s)
 
-VERDICT: PASS. Every probe returned a feature or image bytes on all 17 round(s). That bounds the chance of missing a fault on 1/4 of the instances at 0.0075. It says nothing about a smaller share.
+VERDICT: PASS. Every probe returned a feature or image bytes on all 17 round(s). That bounds the chance of missing a fault on 1/4 of the instances at 0.0075. It says nothing about a smaller share. Cache busting was off, so a cache in front of the server could have answered repeated requests.
 
 Check only. r.csv was not written. Re-run with --apply.
 $ echo $?
@@ -497,7 +567,7 @@ svcsmoke: 1 target(s), 17 round(s) per probe (the fewest that meet --max-miss)
 sampling: 17 round(s) miss a fault on 1/4 of the instances with probability 0.0075 (limit 0.0100), if each request lands on a random instance
 1. PASS         http://127.0.0.1:8807/arcgis/rest/services/Healthy/MapServer  2 probe(s), 35 request(s)
 
-VERDICT: PASS. Every probe returned a feature or image bytes on all 17 round(s). That bounds the chance of missing a fault on 1/4 of the instances at 0.0075. It says nothing about a smaller share.
+VERDICT: PASS. Every probe returned a feature or image bytes on all 17 round(s). That bounds the chance of missing a fault on 1/4 of the instances at 0.0075. It says nothing about a smaller share. Cache busting was off, so a cache in front of the server could have answered repeated requests.
 
 wrote r.csv
 $ echo $?
@@ -510,7 +580,13 @@ tier,target,verdict,probe,requests,failed,kinds,first_failure
 
 The text in the `first_failure` column always starts with words the tool chose, never with text
 the server sent, so a spreadsheet will not read it as a formula. The target URL is whatever you
-typed.
+typed. A report holds service URLs, so `.gitignore` lists `*.csv`. A report with another name is
+not covered.
+
+`--apply` overwrites an existing file named by `--out`, and the tool does not ask. In a gate it
+refuses a file that is the `--tiers` file. It compares file identity, so a hard link or a symbolic
+link to that file is refused too. It does not refuse any other existing file, including the tool
+itself.
 
 ## Other flags
 
@@ -522,7 +598,7 @@ svcsmoke: 1 target(s), 23 round(s) per probe (the fewest that meet --max-miss)
 sampling: 23 round(s) miss a fault on 1/8 of the instances with probability 0.0464 (limit 0.0500), if each request lands on a random instance
 1. PASS         http://127.0.0.1:8809/arcgis/rest/services/Healthy/MapServer  2 probe(s), 47 request(s)
 
-VERDICT: PASS. Every probe returned a feature or image bytes on all 23 round(s). That bounds the chance of missing a fault on 1/8 of the instances at 0.0464. It says nothing about a smaller share.
+VERDICT: PASS. Every probe returned a feature or image bytes on all 23 round(s). That bounds the chance of missing a fault on 1/8 of the instances at 0.0464. It says nothing about a smaller share. Cache busting was off, so a cache in front of the server could have answered repeated requests.
 $ echo $?
 0
 ```
@@ -535,15 +611,32 @@ svcsmoke: 1 target(s), 17 round(s) per probe (set by --rounds)
 sampling: 17 round(s) miss a fault on 1/4 of the instances with probability 0.0075 (limit 0.0100), if each request lands on a random instance
 1. PASS         http://127.0.0.1:8809/arcgis/rest/services/Healthy/MapServer  1 probe(s), 18 request(s)
 
-VERDICT: PASS. Every probe returned a feature or image bytes on all 17 round(s). That bounds the chance of missing a fault on 1/4 of the instances at 0.0075. It says nothing about a smaller share.
+VERDICT: PASS. Every probe returned a feature or image bytes on all 17 round(s). That bounds the chance of missing a fault on 1/4 of the instances at 0.0075. It says nothing about a smaller share. Cache busting was off, so a cache in front of the server could have answered repeated requests.
 $ echo $?
 0
 ```
 
 `--bust-cache` appends `_svcsmoke=<round>`, from 0, to each request. The flag is for a cache that
 sits in front of the server, such as a reverse proxy, which would answer a repeated URL itself.
-The self-test checks that the parameter changes every round and is absent without the flag. I did not test it against a real server, and I
-did not check that a server ignores an unknown parameter.
+The self-test checks that the parameter changes every round and is absent without the flag. I did
+not test it against a real server, and I did not check that a server ignores an unknown parameter.
+
+Without the flag the tool cannot tell a cached answer from a fresh one. A cache that answers every
+round from one reply makes a PASS meaningless, and the printed miss probability does not apply.
+So a PASS without the flag ends with a sentence that says so:
+
+```
+$ python svcsmoke.py http://127.0.0.1:8809/arcgis/rest/services/Healthy/MapServer --bust-cache
+svcsmoke: 1 target(s), 17 round(s) per probe (the fewest that meet --max-miss)
+sampling: 17 round(s) miss a fault on 1/4 of the instances with probability 0.0075 (limit 0.0100), if each request lands on a random instance
+1. PASS         http://127.0.0.1:8809/arcgis/rest/services/Healthy/MapServer  2 probe(s), 35 request(s)
+
+VERDICT: PASS. Every probe returned a feature or image bytes on all 17 round(s). That bounds the chance of missing a fault on 1/4 of the instances at 0.0075. It says nothing about a smaller share.
+$ echo $?
+0
+```
+
+The run above has the flag, so it has no such sentence. Every other PASS in this file shows it.
 
 ## Try it without a server
 
@@ -551,7 +644,8 @@ did not check that a server ignores an unknown parameter.
 this file next to `svcsmoke.py` as `stub.py`. It serves pretend services on 8 pretend instances.
 Run it as `python stub.py 8803 33`, where the second number seeds which requests hit a bad
 instance. The `Pool` service has 2 of 8 instances failing layer 1. `Imagery` has 2 of 8 returning
-an HTML page for `exportImage`.
+an HTML page for `exportImage`. `Draw` is a map service published with the `Map` capability
+only.
 
 Each output in this README came from a stub started for that example. Examples that ran one after
 another against the same port shared a stub, and ran in the order they appear. The gate examples
@@ -587,6 +681,8 @@ def script(path, params, headers):
     instance = int(rng.random() * 8)      # which pretend instance answered
     if path.endswith("/ImageServer"):
         return {"body": json.dumps({"extent": EXTENT}).encode()}
+    if path.endswith("/export"):        # Export Map, on the Draw service
+        return {"body": PNG, "ctype": "image/png"}
     if path.endswith("exportImage"):
         if name == "Imagery" and instance < 2:
             return {"body": PAGE, "ctype": "text/html"}
@@ -599,11 +695,17 @@ def script(path, params, headers):
         if name == "Secure" and "X-Esri-Authorization" not in headers:
             return {"body": json.dumps({"error": {"code": 499, "details": [],
                     "message": "Token Required"}}).encode()}
+        if name == "Draw":      # published with the Map capability only
+            return {"body": json.dumps({"capabilities": "Map",
+                                        "fullExtent": EXTENT,
+                                        "layers": LAYERS[:1]}).encode()}
         if name == "Empty":
             return {"body": json.dumps({"layers": [
                 {"id": 0, "name": "group", "subLayerIds": [1]}]}).encode()}
         return {"body": json.dumps({"layers": LAYERS}).encode()}
     layer = int(parts[-2])
+    if name == "Draw":      # no Data capability, so a layer query is refused
+        return {"body": BAD}
     return {"body": BAD if name == "Pool" and layer == 1 and instance < 2
             else GOOD}
 
@@ -628,8 +730,8 @@ $ python svcsmoke.py http://127.0.0.1:8871/rest/services/Elevation/ImageServer
 svcsmoke: 1 target(s), 17 round(s) per probe (the fewest that meet --max-miss)
 sampling: 17 round(s) miss a fault on 1/4 of the instances with probability 0.0075 (limit 0.0100), if each request lands on a random instance
 1. FAIL         http://127.0.0.1:8871/rest/services/Elevation/ImageServer  2 probe(s), 35 request(s)
-     view overview: 17 of 17 failed (100.0%): NOT_IMAGE x17. First: content type 'application/json; charset=utf-8', body starts '{"error": {"code": 500, "message": "Unable to complete op...' (HTTP 200, recorded only)
-     view detail: 17 of 17 failed (100.0%): NOT_IMAGE x17. First: content type 'application/json; charset=utf-8', body starts '{"error": {"code": 500, "message": "Unable to complete op...' (HTTP 200, recorded only)
+     view overview: 17 of 17 failed (100.0%): NOT_IMAGE x17. First: content type 'application/json; charset=utf-8', body starts '{"error": {"code": 500, "message": "Unable to complete o... (HTTP 200, recorded only)
+     view detail: 17 of 17 failed (100.0%): NOT_IMAGE x17. First: content type 'application/json; charset=utf-8', body starts '{"error": {"code": 500, "message": "Unable to complete o... (HTTP 200, recorded only)
 
 VERDICT: FAILED. 1 target(s) returned no feature or image on at least one request. They are not healthy, whatever their state says.
 $ echo $?
@@ -651,9 +753,11 @@ $ echo $?
 
 - **Blank images.** The 1000 byte minimum is a guess that stands for "a blank export is small".
   A real raster with no data at the centre of the extent can draw a blank detail view and fail.
-  Measure an export of your own imagery, and lower `--min-image-bytes` if a real tile is smaller.
-  The tool does not decode an image, so a corrupt image with a valid header and enough bytes
-  passes.
+  A transparent blank 400 by 400 PNG built with zlib is about 700 bytes, so an empty detail view
+  of a healthy service fails under the default. Measure an export of your own imagery, and lower
+  `--min-image-bytes` if a real tile is smaller. The tool does not decode an image. A blank PNG
+  of at least the minimum passes. So does an image with a valid header and truncated pixel data,
+  when the server sends no `Content-Length` to compare with.
 - **Timeouts.** `--timeout` goes to the socket, so it is a limit on each blocking operation and
   not on the whole response ([urllib.request][urllib]). A server that sends one byte every few
   seconds can outlast it.
@@ -665,14 +769,44 @@ $ echo $?
 - **The report file** is written in place, not through a temporary file. A failed write can leave
   a partial file, and the exit code is 2 even when the services failed. Read the printed
   `VERDICT`, which is above the error.
+- **A features list** passes when it is not empty, even if its entries are `null` or `{}`. The
+  tool checks that a feature came back and not that its content is valid.
+- **A healthy layer with no features** fails its probe, by design. Leave it out with `--layers`.
+- **Stand-alone tables** in the root `tables` array are never probed. A service that holds only
+  tables ends as NOTHING with exit 4.
+- **The root lists no layer type.** A layer that cannot be queried, such as a raster layer, fails
+  its probe until you leave it out with `--layers`. I did not check this against a live server.
+- **Map services without Data.** The tool probes such a service through `export`, which shows
+  that it draws and does not show that its data reads. `--layers` has no effect on it. The
+  switch rests on the two Esri pages cited above, and I did not test it against a live server.
+- **No cache control by default.** Without `--bust-cache` a cache or CDN in front of the server
+  can answer every round from one cached reply. The printed miss probability then does not apply.
+- **The miss probability** holds only for a fault that fails every request on a bad instance.
+- **Compressed bodies.** A body that a proxy gzip-compressed, although the tool sent no
+  `Accept-Encoding` header, is read as `NOT_JSON`. A healthy service behind such a proxy shows as
+  FAIL.
+- **Token forms.** The tool removes the token in its literal form. A server that echoes it
+  URL-encoded, or JSON-escaped (for example `/` sent as `\/`), is not scrubbed.
+- **Proxies.** A service that is reachable only through a mandatory HTTP proxy fails every probe
+  with `TRANSPORT`, because the tool ignores the proxy environment variables on purpose.
+- **Report timing.** The report file is opened only after all sampling ends, so a path that
+  cannot be written is reported after the run and not before it.
+- **The self-test writes** tier and report files into a temporary directory and removes it at the
+  end. That is the one write outside `--apply`. On Windows, repeated runs in a short time can
+  exhaust loopback ports in TIME_WAIT. I saw runs print FAIL lines when that happened. Wait a
+  minute and run again.
+- **CI.** Read the last line of the self-test (`N assertions, 0 failed`) as well as the exit
+  code. A mutation sweep over an earlier version killed 927 of 933 mutants. The six survivors
+  changed no verdict, and the assertions added since pin the defaults and the `GATE:` line. I did
+  not rerun the sweep on this version.
 - **A group layer** is detected by its `subLayerIds`. The Map Service page does not say how a
   group layer is identified, and the examples suggest sub-layers. Name layers with `--layers` if a
   server lists them differently.
 - **Unreachable lines:** none. The branch coverage is 100 percent, with the stub's own
   server code included.
 
-The count fault, run against `restfake.py --image-server --layers 3 --count-fault 1 --apply`.
-The tool passes the service. A count request on layer 1 fails, and a feature request on the same
+The count fault, run against `restfake.py --port 8873 --image-server --layers 3
+--count-fault 1 --apply`. The tool passes the service. A count request on layer 1 fails, and a feature request on the same
 layer reads:
 
 ```
@@ -681,13 +815,13 @@ svcsmoke: 1 target(s), 17 round(s) per probe (the fewest that meet --max-miss)
 sampling: 17 round(s) miss a fault on 1/4 of the instances with probability 0.0075 (limit 0.0100), if each request lands on a random instance
 1. PASS         http://127.0.0.1:8873/rest/services/Basemap/MapServer  3 probe(s), 52 request(s)
 
-VERDICT: PASS. Every probe returned a feature or image bytes on all 17 round(s). That bounds the chance of missing a fault on 1/4 of the instances at 0.0075. It says nothing about a smaller share.
+VERDICT: PASS. Every probe returned a feature or image bytes on all 17 round(s). That bounds the chance of missing a fault on 1/4 of the instances at 0.0075. It says nothing about a smaller share. Cache busting was off, so a cache in front of the server could have answered repeated requests.
 $ echo $?
 0
 
-$ curl -s "http://127.0.0.1:8874/rest/services/Basemap/MapServer/1/query?where=1%3D1&returnCountOnly=true&f=json"
+$ curl -s "http://127.0.0.1:8873/rest/services/Basemap/MapServer/1/query?where=1%3D1&returnCountOnly=true&f=json"
 {"error": {"code": 500, "message": "Unable to complete operation.", "details": ["Error performing query operation", "restfake --count-fault 1"]}}
-$ curl -s "http://127.0.0.1:8874/rest/services/Basemap/MapServer/1/query?where=1%3D1&resultRecordCount=1&returnGeometry=false&outFields=*&f=json" | python -c "import sys, json; print(len(json.load(sys.stdin)[\"features\"]), \"feature(s)\")"
+$ curl -s "http://127.0.0.1:8873/rest/services/Basemap/MapServer/1/query?where=1%3D1&resultRecordCount=1&returnGeometry=false&outFields=*&f=json" | python -c "import sys, json; print(len(json.load(sys.stdin)[\"features\"]), \"feature(s)\")"
 1 feature(s)
 ```
 
@@ -724,6 +858,7 @@ Other single-file tools in this portfolio that pair with this one:
 [monitor]: https://enterprise.arcgis.com/en/monitor/10.8/reports/data-analysis.htm
 [conterra]: https://docs.conterra.de/en/servicemonitor/latest/monitoring/service-job/new.html
 [instances]: https://enterprise.arcgis.com/en/server/12.0/administer/linux/configure-service-instance-settings.htm
+[exportmap]: https://developers.arcgis.com/rest/services-reference/enterprise/export-map/
 [querymap]: https://developers.arcgis.com/rest/services-reference/enterprise/query-map-service-layer/
 [queryfeature]: https://developers.arcgis.com/rest/services-reference/enterprise/query-feature-service-layer/
 [mapservice]: https://developers.arcgis.com/rest/services-reference/enterprise/map-service/
