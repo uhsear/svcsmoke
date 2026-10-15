@@ -3,7 +3,7 @@
 Sample each ArcGIS Server service repeatedly and state how likely the sampling was to miss a
 fault. Pass a service only when it returned a feature or the bytes of an image.
 
-A service reads STARTED. Nothing alerts. For 12 to 14 hours every `exportImage` call on an
+A service reads STARTED. Nothing alerts. For hours, every `exportImage` call on an
 imagery service fails. The service description answers. The admin page is green. Everything a
 check can read says the service is up, because the status says what state the service is in, and
 it does not say whether a request returns anything. Esri's service status operation returns two
@@ -11,7 +11,7 @@ fields, `configuredState` and `realTimeState`, and neither one is the result of 
 ([Service status][status]).
 
 The first fix is a sweep: ask every layer once, and run the sweep after each restart. It finds
-nothing. The fault sits on 2 of the 8 instances in the pool, and one request is answered by one
+nothing. Say the fault sits on 2 of the 8 instances in the pool. One request is answered by one
 instance. A request that lands on a good instance passes. The sweep says the service is fine,
 and a quarter of the people using it still get the error.
 
@@ -47,39 +47,50 @@ PASS  a clean run with too few rounds is UNDERSAMPLED, not a pass  <-- pinned de
 ...
 PASS  a prefix of a flag is refused, not read as the flag: --ap  <-- pinned defect
 PASS  a token the server echoes back is removed from the screen and from the report  <-- pinned defect
-PASS  a 231 character token echoed in an error message is removed whole, not cut to a prefix first  <-- pinned defect
+PASS  a 251 character token echoed in an error message is removed whole, not cut to a prefix first  <-- pinned defect
 PASS  a map service without Data is probed through export as image bytes, never through a layer query  <-- pinned defect
 PASS  and it never probes the tier being restarted or any tier after it  <-- pinned defect
 PASS  a gate does not open on an undersampled pass  <-- pinned defect
 ...
+PASS  a URL that holds only a user name is refused  <-- pinned defect
+PASS  a FeatureServer is queried layer by layer and never exported  <-- pinned defect
+PASS  a redirect to an address with a password does not print it  <-- pinned defect
+PASS  a token echoed in the Content-Type header is removed before the type is cut  <-- pinned defect
+...
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-227 assertions, 0 failed
+269 assertions, 0 failed
 ```
 
-The full run prints all 227 assertions. Each `...` line above is where this block is cut.
+The full run prints all 269 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
-Monitoring a service is a solved problem, and the products below do it well. This tool does one
-thing they do not document, and it does not replace any of them.
+Monitoring a service is a solved problem, and the products below do it well. This tool adds a
+few things that the pages I read do not describe, and it does not replace any of them.
 
 - **Esri Health Check.** `/rest/info/healthcheck` reports "whether the responding machine in the
   ArcGIS Server site is able to receive and process requests"
   ([Health Check][health]). It is the right probe for a load balancer. It speaks for the machine,
   and it cannot say that a given service draws an image.
 - **ArcGIS Monitor.** Esri's monitoring product raises alerts and calculates availability from
-  critical alerts ([ArcGIS Monitor 10.8, data analysis][monitor]). Its Web category lists Http and
-  Url checks with a "Response Time" counter and a "Response Code" counter. I found no counter
-  that reads the body, and nothing about repeated requests or a miss probability. That page does
-  not say whether Monitor stores history, so I make no claim about it. Use Monitor for the alerts.
-  Use this tool for the proof that a service returned data.
+  critical alerts ([ArcGIS Monitor 10.8, data analysis][monitor]). It can read a response body.
+  The 10.8 HTTP counter has optional "Find String" and "Find String Not" fields for text that
+  should or should not appear in the response ([Add an HTTP counter][httpcounter]). Current
+  Monitor documents a Check - Service observer for ArcGIS Server services. Its optional metrics
+  are Check Response Code, Check Response Time, Check Response Size and Check Response Matches,
+  "the total number of matches returned by the regular expression defined in the observer"
+  ([Metrics reference, 2025.0][metrics]). I read the last two on 2026-10-15. They do not
+  describe repeated sampling of one URL, a stated miss probability or an ordered-restart gate,
+  and I make no claim about what Monitor does beyond them. Use Monitor for the alerts, the
+  history and the body match. Use this tool when you want the number of rounds to come from a
+  stated miss probability.
 - **con terra Service Monitor.** A commercial monitor that lists MapServer, FeatureServer and
   ImageServer among its service types. Each check "is based on a request to the service and the subsequent
-  verification of the response" ([Registering a new service][conterra]). It tests reachability,
-  status code, an optional response time and the content. That is the same idea as this tool's
-  pass condition. The page I read does not describe repeating the request or stating a miss
-  probability.
+  verification of the response" ([Registering a new service][conterra], the "latest" page, read
+  on 2026-10-15). It tests reachability, status code, an optional response time and the
+  content. That is the same idea as this tool's pass condition. The page I read does not
+  describe repeating the request or stating a miss probability.
 - **Open-source scripts.** On 2026-10-13, before this repository was public, `gh search repos`
   found no repository named `svcsmoke`. That search now returns this repository, so it cannot be
   repeated. The queries `arcgis health`, `arcgis monitor` and `arcgis service check` returned
@@ -95,9 +106,9 @@ thing they do not document, and it does not replace any of them.
   not a survey.
 
 What this tool adds is narrow. The number of rounds comes from a stated miss probability, and the
-tool prints that probability. A run with too few rounds is not a pass. A probe passes on
-returned data and never on a status. And the ordered-restart gate (below) reuses the same proof
-to decide whether the next tier may restart.
+tool prints that probability. A run with too few rounds is not a pass. And the ordered-restart
+gate (below) reuses the same proof to decide whether the next tier may restart. A probe that
+passes only on returned data, never on a status, is the same idea as the body checks above.
 
 ## Requirements
 
@@ -109,8 +120,8 @@ git clone https://github.com/uhsear/svcsmoke.git
 ```
 
 The self-test starts small HTTP servers on `127.0.0.1` and sends them requests. It needs no
-network and no credentials. It takes about 10 seconds on Windows (Python 3.13) and 4 seconds on
-Linux (Python 3.12), because a few cases wait on a timeout. It prints the same 227
+network and no credentials. It takes about 9 seconds on Windows (Python 3.13) and 3 seconds on
+Linux (Python 3.12), because a few cases wait on a timeout. It prints the same 269
 assertions on Windows (Python 3.13.2), on Python 3.9.25 and on Ubuntu (Python 3.12.3). All three
 outputs are identical line for line, apart from the line endings.
 `coverage run --branch svcsmoke.py --self-test` reports 100 percent of lines and branches.
@@ -136,7 +147,7 @@ python svcsmoke.py --tiers tiers.txt --before app --wait 600
 | `URL` | none | A service URL. Give one per machine. Required unless `--self-test` or `--tiers`. |
 | `--faulty` | `1/4` | The smallest share of instances with a fault that you want to catch, as K/M. `2/8` is the same share. |
 | `--max-miss` | `0.01` | The largest chance that a run passes when that share is faulty. |
-| `--rounds` | the fewest that meet `--max-miss` | Rounds per probe. A smaller number ends in UNDERSAMPLED. |
+| `--rounds` | the fewest that meet `--max-miss` | Rounds per probe. A clean run with fewer rounds ends in UNDERSAMPLED. |
 | `--layers` | every layer that is not a group | Comma-separated layer ids to query. Use it to leave out a layer that is meant to be empty. An ImageServer, and a map service probed through its export, ignore it. An empty value is a usage error. |
 | `--timeout` | `30` | Seconds to wait for one response. At most 86400. |
 | `--min-image-bytes` | `1000` | An image smaller than this counts as blank. A guess; see Limits. |
@@ -415,14 +426,17 @@ The tool takes these steps so that the token reaches the server and nobody else:
   token would cross the network in the clear.
 - Redirects are never followed, so the header cannot be sent on to the host that `Location`
   names. The self-test points one stub at another and checks that the second sees no request.
+  A `Location` that holds `user:password@` is shown without the user name and password.
 - No proxy is used. The tool passes `urllib` an empty proxy table, which the Python documentation
   gives as the way to disable a detected proxy ([urllib.request][urllib]). The self-test sets
   `http_proxy` to a dead port and checks that the request still arrives.
 - The token value and any `token=` parameter are removed from every line the tool prints and
   from the report. The tool removes them from the whole reply body before it cuts the text to a
   length, so a token longer than the cut does not survive as a prefix. The self-test has servers
-  that echo a 231 character token back in an error message and in an HTML page, and greps the
-  screen and the report for it. An unexpected error and a usage error are scrubbed the same way.
+  that echo a 251 character token back in an error message and in an HTML page, and greps the
+  screen and the report for it. A token that a server echoes in a `Content-Type` header is
+  removed before the type is cut to 40 characters. An unexpected error and a usage error are
+  scrubbed the same way.
 - A trailing newline or carriage return on the token, as from a token file, is stripped. A token
   with a space, a control character or a non-ASCII character is refused at the start, and the
   message does not quote it.
@@ -441,6 +455,17 @@ db: http://127.0.0.1:8808/arcgis/rest/services/Healthy/MapServer
 app: http://127.0.0.1:8808/arcgis/rest/services/Pool/MapServer
 web: http://127.0.0.1:8808/arcgis/rest/services/Healthy/MapServer
 ```
+
+A tier can name several URLs on one line, separated by spaces. Give one URL for each machine in
+the tier. The gate then probes each of them:
+
+```
+db: https://db1.example.com/arcgis/rest/services/Roads/MapServer https://db2.example.com/arcgis/rest/services/Roads/MapServer
+app: https://app1.example.com/arcgis/rest/services/Roads/MapServer
+```
+
+The self-test uses this form: its `db` tier has two targets, and the gate for `app` opens only
+when both pass.
 
 The gate probes every tier above the one named and nothing else. It never probes the tier being
 restarted or a tier after it. It opens, with exit 0, only when every target in those tiers
@@ -579,13 +604,16 @@ tier,target,verdict,probe,requests,failed,kinds,first_failure
 ```
 
 The text in the `first_failure` column always starts with words the tool chose, never with text
-the server sent, so a spreadsheet will not read it as a formula. The target URL is whatever you
-typed. A report holds service URLs, so `.gitignore` lists `*.csv`. A report with another name is
+the server sent, so a spreadsheet will not read it as a formula. The `tier` column is the tier
+name as you typed it in the tiers file, so a tier named `=1+1` opens as a formula in a
+spreadsheet. Name tiers with letters. The target URL is whatever you typed. A report holds service URLs, so `.gitignore` lists `*.csv`. A report with another name is
 not covered.
 
 `--apply` overwrites an existing file named by `--out`, and the tool does not ask. In a gate it
 refuses a file that is the `--tiers` file. It compares file identity, so a hard link or a symbolic
-link to that file is refused too. It does not refuse any other existing file, including the tool
+link to that file is refused too. The self-test makes a hard link only, because Windows cannot
+make a symbolic link without a privilege. I checked the symbolic-link case by hand on Linux
+(Python 3.12), where the run exits 64. It does not refuse any other existing file, including the tool
 itself.
 
 ## Other flags
@@ -757,7 +785,10 @@ $ echo $?
   of a healthy service fails under the default. Measure an export of your own imagery, and lower
   `--min-image-bytes` if a real tile is smaller. The tool does not decode an image. A blank PNG
   of at least the minimum passes. So does an image with a valid header and truncated pixel data,
-  when the server sends no `Content-Length` to compare with.
+  when the server sends no `Content-Length` to compare with. A solid-colour 400 by 400 JPEG is
+  about 3 KB, and a solid opaque white PNG of that size is about 1.4 KB (measured with Pillow
+  12.3.0), so a blank opaque export passes the byte minimum. Only a transparent blank PNG, about
+  700 bytes, falls under it.
 - **Timeouts.** `--timeout` goes to the socket, so it is a limit on each blocking operation and
   not on the whole response ([urllib.request][urllib]). A server that sends one byte every few
   seconds can outlast it.
@@ -785,20 +816,56 @@ $ echo $?
 - **Compressed bodies.** A body that a proxy gzip-compressed, although the tool sent no
   `Accept-Encoding` header, is read as `NOT_JSON`. A healthy service behind such a proxy shows as
   FAIL.
-- **Token forms.** The tool removes the token in its literal form. A server that echoes it
-  URL-encoded, or JSON-escaped (for example `/` sent as `\/`), is not scrubbed.
+- **Token forms.** The tool removes the token in its literal form. It also removes a token
+  that a JSON body echoes with `/` sent as `\/`, because the text is scrubbed again after the
+  body is parsed. A server that echoes the token URL-encoded (`/` as `%2F`) is not scrubbed. The
+  self-test shows both.
 - **Proxies.** A service that is reachable only through a mandatory HTTP proxy fails every probe
   with `TRANSPORT`, because the tool ignores the proxy environment variables on purpose.
 - **Report timing.** The report file is opened only after all sampling ends, so a path that
   cannot be written is reported after the run and not before it.
 - **The self-test writes** tier and report files into a temporary directory and removes it at the
-  end. That is the one write outside `--apply`. On Windows, repeated runs in a short time can
-  exhaust loopback ports in TIME_WAIT. I saw runs print FAIL lines when that happened. Wait a
-  minute and run again.
+  end. That is the one write outside `--apply`.
+- **One connection for every request.** The tool opens a new connection for each request. On
+  Windows each closed connection keeps its port in TIME_WAIT for a few minutes. A burst of runs
+  can use every ephemeral port, and a request then shows `OSError (errno 10048)` as a false
+  TRANSPORT failure. The self-test sends about 500 requests and makes the same demand. Wait a
+  minute and run again. A self-test that fails for this reason prints FAIL lines and exits 1.
 - **CI.** Read the last line of the self-test (`N assertions, 0 failed`) as well as the exit
-  code. A mutation sweep over an earlier version killed 927 of 933 mutants. The six survivors
-  changed no verdict, and the assertions added since pin the defaults and the `GATE:` line. I did
-  not rerun the sweep on this version.
+  code. A CI step must require the text `0 failed`, because a self-test that printed nothing
+  would also exit 0. A red self-test exits 1, the same code as a failed service.
+- **Mutation sweep.** I ran 760 mutants of the non-test code of this version, on Linux with Python
+  3.12.3. The sweep is a scratch script and is not shipped. It flips comparisons, boolean
+  operators, constants, branches and return values. The self-test killed 735 and 25 survived.
+  Eleven survivors change only how long a quoted text is cut. Two change a read cap and a split
+  limit with no visible effect. Four are equivalent mutants. Three sit in the starting guess of
+  `rounds_needed`. Five replace the return value of `main()` or the `__name__` guard, so the
+  self-test never runs, and that is why a CI step must require `0 failed`. The same sweep run on
+  Windows, while other loopback jobs ran, gave false kills from port exhaustion (errno 10048).
+  Only the Linux result is valid.
+- **The estimate in `rounds_needed`.** The logarithm only sets where the search starts. The loop
+  that follows decides the answer.
+- **Huge numbers.** A `--rounds` above about 1e308 ends in exit 70 against a target with no
+  plan. So does a root extent with an integer of more than about 308 digits. Both fail closed,
+  and neither is a finding.
+- **Bad host names.** A host name with an empty label, or a label over 63 characters, ends the
+  run with exit 64 and an `idna` message. It is not reported as a failed service.
+- **Map services with Data.** A map service that has the Data capability is probed with layer
+  queries only. Its export is never requested, so a map service that draws badly while its
+  queries work reads PASS.
+- **Redirects to https.** A server that redirects `http` to `https` makes a healthy service FAIL
+  with `REDIRECT`. Give the `https` URL.
+- **One token for every tier.** The same token goes to every URL in a `--tiers` file, including
+  the `https` hosts you wrote there.
+- **`--max-requests` is per survey.** With `--wait` the gate runs a new survey on each poll, so
+  the total over the wait is not capped.
+- **Custom coordinate systems.** An ImageServer root whose spatial reference has only `wkt`, with
+  no `wkid` or `latestWkid`, ends as NOTHING with exit 4, so a healthy service in a custom
+  coordinate system cannot be probed.
+- **No network.** A workstation that has lost its network sends every probe to TRANSPORT and
+  exits 1, the same as a service outage. A gate closes in that case.
+- **The gate line and the cache.** With `--bust-cache` off, a PASS and an open gate can come
+  from a cache. The VERDICT line says so, and the `GATE: OPEN` line does not repeat it.
 - **A group layer** is detected by its `subLayerIds`. The Map Service page does not say how a
   group layer is identified, and the examples suggest sub-layers. Name layers with `--layers` if a
   server lists them differently.
@@ -856,6 +923,8 @@ Other single-file tools in this portfolio that pair with this one:
 
 [health]: https://developers.arcgis.com/rest/services-reference/enterprise/health-check/
 [monitor]: https://enterprise.arcgis.com/en/monitor/10.8/reports/data-analysis.htm
+[httpcounter]: https://enterprise.arcgis.com/en/monitor/10.8/administration/add-an-http-counter.htm
+[metrics]: https://doc.arcgis.com/en/monitor/2025.0/get-started/windows/metrics-reference.htm
 [conterra]: https://docs.conterra.de/en/servicemonitor/latest/monitoring/service-job/new.html
 [instances]: https://enterprise.arcgis.com/en/server/12.0/administer/linux/configure-service-instance-settings.htm
 [exportmap]: https://developers.arcgis.com/rest/services-reference/enterprise/export-map/

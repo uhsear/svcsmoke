@@ -322,7 +322,9 @@ def judge(service_kind, reply, min_bytes, token):
     if reply.error:
         kind, detail = reply.error, reply.detail
     elif service_kind == IMAGE_SERVER:
-        kind, detail = classify_image(reply.ctype, body, min_bytes)
+        # The content type is quoted in the detail, so scrub it before the cut.
+        kind, detail = classify_image(scrub(reply.ctype or "", token), body,
+                                      min_bytes)
     else:
         kind, detail = classify_features(body)
     if kind == OK and reply.status != 200:
@@ -419,7 +421,8 @@ def pick_layers(doc, wanted):
     for entry in entries:
         if not isinstance(entry, dict) or not _is_int(entry.get("id")):
             continue
-        if entry.get("subLayerIds"):
+        # A repeated id would be probed twice and double its requests.
+        if entry.get("subLayerIds") or entry["id"] in ids:
             continue
         ids.append(entry["id"])
     return ids
@@ -747,7 +750,8 @@ def _reply(resp, max_body):
     if 300 <= status < 400:
         try:
             where = urllib.parse.urlsplit(resp.headers.get("Location", ""))
-            place = where.netloc + where.path
+            # Drop any user:password@ so a credential in Location is not shown.
+            place = where.netloc.rpartition("@")[2] + where.path
         except ValueError:
             place = "an unreadable address"
         return Reply(status, ctype, b"", REDIRECT, "redirected to " + place)
@@ -756,7 +760,8 @@ def _reply(resp, max_body):
         return Reply(status, ctype, b"", TOO_LARGE,
                      "body over %d bytes" % max_body)
     declared = resp.headers.get("Content-Length", "")
-    if declared.isdigit() and int(declared) != len(body):
+    # isdigit() is true for a superscript two, which int() then refuses.
+    if declared.isascii() and declared.isdigit() and int(declared) != len(body):
         return Reply(status, ctype, b"", TRANSPORT,
                      "body cut short: %d of %s bytes" % (len(body), declared))
     return Reply(status, ctype, body)
@@ -1041,6 +1046,18 @@ def _assertions(tmp, passed, failed, stubs):
 
     def target(stub, path, kind=MAP_SERVER, tier=None):
         return Target(stub.url(path), kind, tier)
+
+    # A request that fails in transport leaves no stats, no root and no first
+    # failure. These read as empty, so such a run shows as failed checks and
+    # not as an IndexError that ends the self-test.
+    def stat(res, i=0):
+        return (res.stats + [ProbeStat("missing")] * (i + 1))[i]
+
+    def first(res, i=0):
+        return stat(res, i).first or (None, "", None)
+
+    def root_of(res):
+        return res.root or (None, "", None)
 
     print("svcsmoke self-test: loopback stub only, no network, no credentials")
     print("-" * 68)
@@ -1449,9 +1466,9 @@ def _assertions(tmp, passed, failed, stubs):
         "body": map_root() if path.endswith("/MapServer") else ERR})
     res = survey([target(stub, "/svc/MapServer")], opts(rounds=2),
                  make_fetcher(None, 5))[0]
-    check(res.verdict == FAIL and res.stats[0].failed == 2
-          and res.stats[0].first[2] == 200
-          and res.stats[0].kinds == {SERVER_ERROR: 2},
+    check(res.verdict == FAIL and stat(res).failed == 2
+          and first(res)[2] == 200
+          and stat(res).kinds == {SERVER_ERROR: 2},
           "a service that answers 200 with an error every time is a FAIL "
           "with the 200 recorded  <-- pinned defect")
 
@@ -1461,8 +1478,7 @@ def _assertions(tmp, passed, failed, stubs):
         "body": map_root()})
     res = survey([target(stub, "/svc/MapServer")], opts(rounds=1),
                  make_fetcher(None, 5))[0]
-    check(res.stats[0].first[0] == NOT_JSON
-          and "Sign In" in res.stats[0].first[1],
+    check(first(res)[0] == NOT_JSON and "Sign In" in first(res)[1],
           "a login page where JSON was expected is a failed probe")
 
     landing = serve(lambda path, params, headers: {"body": GOOD})
@@ -1538,14 +1554,14 @@ def _assertions(tmp, passed, failed, stubs):
     stub = serve(image_pool(1, 1, random.Random(1)))
     res = survey([target(stub, "/img/ImageServer", IMAGE_SERVER)],
                  opts(rounds=2), make_fetcher(None, 5))[0]
-    check(res.verdict == FAIL and res.stats[0].kinds == {NOT_IMAGE: 2}
-          and res.stats[1].kinds == {NOT_IMAGE: 2},
+    check(res.verdict == FAIL and stat(res).kinds == {NOT_IMAGE: 2}
+          and stat(res, 1).kinds == {NOT_IMAGE: 2},
           "an image service that answers 200 with a page fails both views"
           "  <-- pinned defect")
     stub = serve(image_pool(1, 0, random.Random(1), image=PNG[:300]))
     res = survey([target(stub, "/img/ImageServer", IMAGE_SERVER)],
                  opts(rounds=1), make_fetcher(None, 5))[0]
-    check(res.stats[0].kinds == {SMALL_IMAGE: 1},
+    check(stat(res).kinds == {SMALL_IMAGE: 1},
           "a tiny image is a failed probe")
 
     stub = serve(pool(1, 0, random.Random(1)))
@@ -1565,8 +1581,9 @@ def _assertions(tmp, passed, failed, stubs):
         "status": 503, "body": HTML, "ctype": "text/html"})
     res = survey([target(stub, "/svc/MapServer")], opts(),
                  make_fetcher(None, 5))[0]
-    check(res.verdict == FAIL and res.root[0] == NOT_JSON
-          and res.root[2] == 503 and res.requests == 1 and res.stats == [],
+    check(res.verdict == FAIL and root_of(res)[0] == NOT_JSON
+          and root_of(res)[2] == 503 and res.requests == 1
+          and res.stats == [],
           "a root that fails is a FAIL with one request spent")
     stub = serve(lambda path, params, headers: {
         "body": json.dumps({"layers": [{"id": 0, "subLayerIds": [1]}]}
@@ -1604,13 +1621,23 @@ def _assertions(tmp, passed, failed, stubs):
                                             "/svc/MapServer/5/query"],
           "--layers names the layers to query whatever the root lists")
 
-    # ---- a pool where only some instances are bad, over the network
-    stub = serve(pool(8, 2, random.Random(5)))
+    # ---- a pool where only some instances are bad
+    # The real survey() runs 100 times over the pool's script with an
+    # in-process fetch. 900 loopback requests would use 900 ephemeral ports,
+    # and Windows keeps each one in TIME_WAIT for minutes. The network path is
+    # exercised by the other cases.
+    script = pool(8, 2, random.Random(5))
+
+    def in_process(url):
+        path = urllib.parse.urlsplit(url).path
+        answer = script(path, {}, {})
+        return Reply(200, answer.get("ctype", "application/json"),
+                     answer["body"])
     seen = 0
     runs = 100
     for _ in range(runs):
-        res = survey([target(stub, "/svc/MapServer")], opts(rounds=8),
-                     make_fetcher(None, 5))[0]
+        res = survey([Target("http://pool.invalid/svc/MapServer", MAP_SERVER)],
+                     opts(rounds=8), in_process)[0]
         seen += res.verdict == FAIL
     check(60 <= seen <= 98,
           "a pool with 2 of 8 instances bad is caught by 8 rounds in most "
@@ -1645,7 +1672,8 @@ def _assertions(tmp, passed, failed, stubs):
           "one failing target among two fails the run with its rate")
     code, out, err = run(["--layers", "4", stub.url("/svc/MapServer"),
                           "--rounds", "1"])
-    check(code == 3 and stub.requests[-1][0] == "/svc/MapServer/4/query",
+    check(code == 3 and [r[0] for r in stub.requests[-1:]]
+          == ["/svc/MapServer/4/query"],
           "--layers 4 queries layer 4")
     for argv, why in (
             ([], "no URL and no tiers"),
@@ -1672,6 +1700,8 @@ def _assertions(tmp, passed, failed, stubs):
              "--timeout inf"),
             ([stub.url("/svc/MapServer"), "--timeout", "1e30"],
              "--timeout 1e30"),
+            ([stub.url("/svc/MapServer"), "--timeout", "86400.5"],
+             "--timeout 86400.5"),
             ([stub.url("/svc/MapServer"), "--interval", "inf"],
              "--interval inf"),
             (["--tiers", "t", "--before", "b", "--wait", "nan"],
@@ -1870,8 +1900,9 @@ def _assertions(tmp, passed, failed, stubs):
             written = handle.read()
         check(code == 1 and long_token[:8] not in out + err + written
               and "[token]" in out + written,
-              "a 231 character token echoed in %s is removed whole, not cut "
-              "to a prefix first  <-- pinned defect" % what)
+              "a %d character token echoed in %s is removed whole, not cut "
+              "to a prefix first  <-- pinned defect"
+              % (len(long_token), what))
     check(scrub_body(b"a SECRET b token=xyz&q=1", "SECRET")
           == b"a [token] b token=[token]&q=1"
           and scrub_body(b"plain", None) == b"plain",
@@ -2009,16 +2040,19 @@ def _assertions(tmp, passed, failed, stubs):
           == ([], "the service lists no layer to query"),
           "a service whose root lists only stand-alone tables probes nothing")
 
-    class Bare(object):
-        """A response with no Content-Length header and a short body."""
-        headers = {"Content-Type": "image/png"}
+    class Canned(object):
+        """A response object for _reply: a status, headers and a body."""
+
+        def __init__(self, status, headers, body=b""):
+            self.status, self.headers, self.body = status, headers, body
 
         def getcode(self):
-            return 200
+            return self.status
 
         def read(self, size):
-            return PNG[:100]
-    short = _reply(Bare(), MAX_BODY)
+            return self.body[:size]
+    short = _reply(Canned(200, {"Content-Type": "image/png"}, PNG[:100]),
+                   MAX_BODY)
     check(short.error is None and classify_image(
         short.ctype, short.body, 0)[0] == OK,
           "without a Content-Length a cut-short image cannot be told from a "
@@ -2038,6 +2072,236 @@ def _assertions(tmp, passed, failed, stubs):
           == SMALL_IMAGE,
           "a transparent blank 400 by 400 PNG is under the default minimum, "
           "so an empty detail view fails")
+
+    # ---- audit round 2: each case below was a reproduced defect
+    for what, bad_url in (
+            ("user name", "https://sekret-user@h.example/x/MapServer"),
+            ("password", "https://:sekretpw@h.example/x/MapServer")):
+        raises(lambda b=bad_url: check_target(b, None),
+               "a URL that holds only a %s is refused  <-- pinned defect"
+               % what)
+
+    # A FeatureServer is a supported kind. Its capabilities list has no Data,
+    # and it still has to be queried, never exported.
+    def feature_root(path, params, headers):
+        if path.endswith("/FeatureServer"):
+            return {"body": json.dumps({
+                "capabilities": "Query,Create,Update,Delete",
+                "fullExtent": EXTENT,
+                "layers": [{"id": 0, "subLayerIds": None}]}).encode()}
+        return {"body": GOOD}
+    feature_stub = serve(feature_root)
+    res = survey([target(feature_stub, "/f/FeatureServer", FEATURE_SERVER)],
+                 opts(rounds=2), make_fetcher(None, 5))[0]
+    check(res.verdict == PASS and res.requests == 3
+          and [r[0] for r in feature_stub.requests]
+          == ["/f/FeatureServer", "/f/FeatureServer/0/query",
+              "/f/FeatureServer/0/query"],
+          "a FeatureServer is queried layer by layer and never exported  "
+          "<-- pinned defect")
+    code, out, err = run([feature_stub.url("/f/FeatureServer")])
+    check(code == 0 and "VERDICT: PASS" in out
+          and not any(r[0].endswith("/export") for r in feature_stub.requests),
+          "a FeatureServer URL on the command line passes on a feature")
+    FULL = {"fullExtent": EXTENT, "layers": [{"id": 4}]}
+    check([p.name for p in build_plan(FEATURE_SERVER, dict(
+        FULL, capabilities="Query"), [])[0]] == ["layer 4"]
+          and [p.name for p in build_plan(MAP_SERVER, dict(
+              FULL, capabilities="Map,Query,Data"), [])[0]] == ["layer 4"],
+          "only a map service without Data is exported, never a feature "
+          "service or a map service with Data  <-- pinned defect")
+
+    # Every extent above is centred on 0. A real Web Mercator extent is not.
+    views, why = views_from_root({"extent": {
+        "xmin": -9200000, "ymin": 3300000, "xmax": -9100000, "ymax": 3500000,
+        "spatialReference": {"wkid": 3857}}})
+    check([v.bbox for v in views]
+          == [(-9250000.0, 3300000.0, -9050000.0, 3500000.0),
+              (-9151000.0, 3399000.0, -9149000.0, 3401000.0)],
+          "a tall extent away from the origin gets a square overview and a "
+          "1/100 detail around its centre  <-- pinned defect")
+    views, why = views_from_root({"extent": {
+        "xmin": -9200000, "ymin": 3300000, "xmax": -9000000, "ymax": 3350000,
+        "spatialReference": {"wkid": 3857}}})
+    check([v.bbox for v in views]
+          == [(-9200000.0, 3225000.0, -9000000.0, 3425000.0),
+              (-9101000.0, 3324000.0, -9099000.0, 3326000.0)],
+          "a wide extent away from the origin is squared on its width")
+
+    # The report text, the CSV and the trailing lines, pinned whole.
+    plain = describe([good, bad], ctx)
+    check("nothing probed" not in "\n".join(plain)
+          and "root:" not in "\n".join(plain),
+          "a target with a plan prints no 'nothing probed' or 'root' line"
+          "  <-- pinned defect")
+    lines = describe([good], ctx)
+    check(lines[-2] == "" and lines[-1].startswith("VERDICT: PASS. ")
+          and lines[-1].endswith("could have answered repeated requests."),
+          "the cache note ends the VERDICT line, not the blank line before it"
+          "  <-- pinned defect")
+    stat_two = ProbeStat("p")
+    for outcome in ((OK, "", 200), (NOT_JSON, "first", 200),
+                    (SERVER_ERROR, "second", 500)):
+        stat_two.add(outcome)
+    check(stat_two.first == (NOT_JSON, "first", 200)
+          and (stat_two.requests, stat_two.failed) == (3, 2)
+          and stat_two.kinds == {NOT_JSON: 1, SERVER_ERROR: 1},
+          "the first failure of a probe is kept, not replaced by the last"
+          "  <-- pinned defect")
+    rooted = result(0, root=(NOT_JSON, "not JSON, page titled 'Down'", 503))
+    rooted.verdict = FAIL
+    row = report_rows([rooted])[0]
+    check(row["first_failure"] == "not JSON, page titled 'Down'"
+          and (row["failed"], row["kinds"]) == (1, NOT_JSON),
+          "a failed root writes its failure text to first_failure, not its "
+          "status  <-- pinned defect")
+    ok_stub = serve(pool(1, 0, random.Random(3)))
+    code, out, err = run([ok_stub.url("/svc/MapServer")])
+    check(code == 0 and "Check only" not in out and "not written" not in out
+          and out.rstrip().endswith("could have answered repeated requests."),
+          "a run without --out prints no 'not written' line  "
+          "<-- pinned defect")
+    code, out, err = run(["--before", "app"])
+    check(code == 64 and "--tiers and --before go together" in err,
+          "--before alone, with no URL, is refused for that reason"
+          "  <-- pinned defect")
+
+    # A Location header that carries user:password@ must not print it.
+    reply = make_fetcher(None, 5)(serve(lambda path, params, headers: {
+        "status": 302, "headers": {
+            "Location": "http://alice:hunter2pw@127.0.0.1:1/login"}}).url("/x"))
+    check(reply.error == REDIRECT
+          and reply.detail == "redirected to 127.0.0.1:1/login"
+          and "hunter2pw" not in reply.detail and "alice" not in reply.detail,
+          "a redirect to an address with a password does not print it"
+          "  <-- pinned defect")
+    kind, detail, status = judge(IMAGE_SERVER, Reply(
+        200, "x" * 30 + long_token, HTML), 1, long_token)
+    check(kind == NOT_IMAGE and "eyJ0b2t" not in detail
+          and "[token]" in detail,
+          "a token echoed in the Content-Type header is removed before the "
+          "type is cut  <-- pinned defect")
+    # A Content-Length of a superscript two passes isdigit() and fails int().
+    odd = _reply(Canned(200, {"Content-Type": "image/png",
+                              "Content-Length": "\u00b2"}, PNG), MAX_BODY)
+    check(odd.error is None and odd.body == PNG,
+          "a Content-Length that is not ASCII digits is ignored, not a "
+          "crash  <-- pinned defect")
+    check(pick_layers({"layers": [{"id": 0}, {"id": 1}, {"id": 0}]}, [])
+          == [0, 1],
+          "a layer id the root lists twice is probed once  <-- pinned defect")
+
+    # ---- the token forms the README Limits section states
+    slash = "TOK/abc9"
+    escaped = json.dumps({"error": {"message": "bad " + slash}}).encode(
+    ).replace(b"/", b"\\/")
+    check(b"TOK\\/abc9" in escaped
+          and "TOK" not in judge(MAP_SERVER, Reply(200, "", escaped), 1,
+                                 slash)[1],
+          "a token the server echoes with its slash JSON-escaped is still "
+          "removed")
+    quoted = json.dumps({"error": {"message": "bad TOK%2Fabc9"}}).encode()
+    check("TOK%2Fabc9" in judge(MAP_SERVER, Reply(200, "", quoted), 1,
+                                slash)[1],
+          "a token the server echoes URL-encoded is not removed")
+
+    # ---- boundaries: the value on each side of every limit
+    check(parse_faulty("4/4") == 1.0 and parse_faulty("10000/10000") == 1.0
+          and parse_faulty("1/10000") == 0.0001,
+          "--faulty accepts K equal to M, and M of 10000")
+    check(classify_image("image/png", PNG[:1000], 1000)[0] == OK
+          and classify_image("image/png", PNG[:999], 1000)[0] == SMALL_IMAGE,
+          "an image of exactly --min-image-bytes passes, one byte less fails")
+    check(make_fetcher(None, 5, max_body=100)(big.url("/x")).error is None
+          and make_fetcher(None, 5, max_body=99)(big.url("/x")).error
+          == TOO_LARGE,
+          "a body of exactly the cap is read, one byte over it is TOO_LARGE")
+    check([_reply(Canned(status, {"Location": "/a"}), MAX_BODY).error
+           for status in (299, 300, 399, 400)] == [None, REDIRECT, REDIRECT,
+                                                   None],
+          "a 3xx status, 300 through 399, is a redirect and no other is")
+    stub = serve(pool(1, 0, random.Random(1)))
+    check(len(survey([target(stub, "/svc/MapServer")],
+                     opts(rounds=3, max_requests=4), make_fetcher(None, 5))
+              [0].stats) == 1,
+          "a plan exactly equal to --max-requests is sampled")
+    raises(lambda: survey([target(stub, "/svc/MapServer")],
+                          opts(rounds=3, max_requests=3),
+                          make_fetcher(None, 5)),
+           "and a plan one over it is refused")
+    code, out, err = run([ok_stub.url("/svc/MapServer"), "--max-requests",
+                          "1"])
+    check(code == 64 and "Nothing was sampled" in err
+          and "must be at least 1" not in err,
+          "--max-requests 1 is a valid limit, and the plan is what is "
+          "refused")
+    code, out, err = run(["--tiers", tier_path, "--before", "app", "--wait",
+                          "86400", "--interval", "86400", "--timeout",
+                          "86400"])
+    check(code == 0 and "GATE: OPEN" in out,
+          "--wait, --interval and --timeout accept exactly 86400 seconds")
+    check(check_target("http://h.example/!/MapServer", None)[1] == MAP_SERVER
+          and check_target("http://h.example/~/MapServer", None)[1]
+          == MAP_SERVER,
+          "the printable ASCII characters '!' and '~' are allowed in a URL")
+    raises(lambda: check_target("http://h.example/\x7f/MapServer", None),
+           "DEL is refused in a URL")
+    raises(lambda: check_target("http://h.example/ /MapServer", None),
+           "a space is refused in a URL")
+    code, out, err = run([ok_stub.url("/svc/MapServer")], token="!tok~")
+    check(code == 0 and ok_stub.requests[-1:] != []
+          and ok_stub.requests[-1][2].get("X-Esri-Authorization")
+          == "Bearer !tok~",
+          "a token of '!' through '~' is sent as it is")
+    code, out, err = run([ok_stub.url("/svc/MapServer")], token="tok\x7f")
+    check(code == 64 and "SVCSMOKE_TOKEN may hold only" in err,
+          "a token with DEL is refused")
+
+    # ---- messages and small limits that the first sweep showed unpinned
+    check(MAX_BODY == 16 * 1024 * 1024 and parse_faulty("1/1") == 1.0,
+          "the body cap is 16 MB, and --faulty 1/1 is the smallest valid pool")
+    check(tidy("a\x7fb") == "a?b" and tidy("x" * 100) == "x" * 100
+          and tidy("x" * 101) == "x" * 97 + "...",
+          "tidy replaces DEL, keeps a line of exactly its limit and cuts one "
+          "byte over it")
+    try:
+        tiers_before(tiers, "nope")
+    except ValueError as exc:
+        check(str(exc) == "no tier named 'nope'. The file has: db, app, web",
+              "an unknown tier is refused by name, with the tiers the file has")
+    numbered = "\n".join(describe([good, bad], ctx))
+    check("\n1. PASS " in "\n" + numbered and "\n2. FAIL " in numbered,
+          "the report numbers its targets from 1")
+    code, out, err = run([ok_stub.url("/svc/MapServer"), "--max-requests",
+                          "5"])
+    check("the plan is 18 request(s) (1 probe(s) over 17 round(s), plus 1 to "
+          "read the service roots), over --max-requests 5." in err,
+          "a refused plan says how many requests it was and why")
+    code, out, err = run([ok_stub.url("/svc/MapServer"), "--layers", "a,1"])
+    check(code == 64 and "--layers must be comma-separated layer ids" in err,
+          "a bad --layers value is refused by name")
+    gone = os.path.join(tmp, "not-yet.txt")
+    code, out, err = run(["--tiers", gone, "--before", "app", "--out", gone,
+                          "--apply"])
+    check(code == 64 and "also the --tiers file" in err
+          and not os.path.exists(gone),
+          "--out spelled as a --tiers file that does not exist yet is "
+          "refused before anything is read or written")
+    code, out, err = run([ok_stub.url("/svc/MapServer"), "--timeout", "0.5",
+                          "--min-image-bytes", "0"])
+    check(code == 0, "--timeout 0.5 and --min-image-bytes 0 are accepted")
+    ascii_out = io.TextIOWrapper(io.BytesIO(), encoding="ascii",
+                                  newline="\n")
+    saved_stdout, sys.stdout = sys.stdout, ascii_out
+    try:
+        _tolerate_odd_characters()
+        print("caf" + chr(233))
+        ascii_out.flush()
+    finally:
+        sys.stdout = saved_stdout
+    check(ascii_out.buffer.getvalue() == b"caf?\n",
+          "a console that cannot encode a character prints a replacement and "
+          "not a traceback")
 
     # ---- the harness, the crash exit and the import
     _restore_env("SVCSMOKE_SELFTEST_PROBE", "kept")
