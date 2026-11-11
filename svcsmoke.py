@@ -8,13 +8,16 @@ This tool states that miss probability, refuses to call a run healthy when the
 rounds are too few to support the claim, and counts a probe as passed only when
 the body holds a feature or the bytes of an image. The HTTP status is recorded
 and never decides. A map service whose capabilities leave out Data cannot be
-queried, so its export is probed for image bytes instead.
+queried, so its export is probed for image bytes and each layer is asked to
+describe itself. A layer that fails to load fails the service, whichever probe
+finds it.
 
     python svcsmoke.py --self-test
     python svcsmoke.py URL [URL ...]
     python svcsmoke.py URL --faulty 2/8 --max-miss 0.01
     python svcsmoke.py URL --rounds 8
     python svcsmoke.py URL --layers 0,3
+    python svcsmoke.py URL --layer-resources
     python svcsmoke.py URL --out report.csv --apply
     python svcsmoke.py --tiers tiers.txt --before app --wait 600
 
@@ -128,6 +131,7 @@ TOO_LARGE = "TOO_LARGE"        # body over MAX_BODY
 NOT_JSON = "NOT_JSON"          # an HTML page, a login form, a cut-off body
 SERVER_ERROR = "SERVER_ERROR"  # a JSON body with an error property
 NO_FEATURES = "NO_FEATURES"    # JSON, no error, and no feature in it
+BAD_LAYER = "BAD_LAYER"        # a layer resource that names no layer, or another
 NOT_IMAGE = "NOT_IMAGE"        # not an image content type or not image bytes
 SMALL_IMAGE = "SMALL_IMAGE"    # image bytes, fewer than the minimum
 HTTP_STATUS = "HTTP_STATUS"    # evidence in the body, but the status is not 200
@@ -286,6 +290,25 @@ def classify_features(body):
     return OK, ""
 
 
+def classify_layer(body, layer_id):
+    """A layer resource body -> (kind, detail). OK only when it names the layer.
+
+    A layer that cannot load answers with an error property or with a page, or
+    describes no layer at all. Esri documents the id property of the layer
+    resource and says nothing about what an invalid layer returns, so any
+    answer that is not this layer's own description fails.
+    """
+    doc, failure = parse_json(body)
+    if failure:
+        return failure
+    if "error" in doc:
+        return SERVER_ERROR, error_text(doc)
+    if not _is_int(doc.get("id")) or doc["id"] != layer_id:
+        return BAD_LAYER, "resource of layer %d has id %s" % (
+            layer_id, tidy(str(doc.get("id")), 20))
+    return OK, ""
+
+
 def classify_image(ctype, body, min_bytes):
     """An export body -> (kind, detail). OK only for image bytes of some size."""
     if not (ctype or "").lower().startswith("image/"):
@@ -310,17 +333,20 @@ class Reply(object):
         self.detail = detail
 
 
-def judge(service_kind, reply, min_bytes, token):
+def judge(service_kind, reply, min_bytes, token, resource_of=None):
     """A reply -> (kind, detail, status).
 
     The body must hold the evidence: a feature, or image bytes. Esri says a
     status of 200 means the request was processed and any other status is a
     problem, so a good body under another status fails too. The status alone
-    never passes a probe.
+    never passes a probe. With resource_of, the reply is a layer resource and
+    must describe that layer.
     """
     body = scrub_body(reply.body, token)
     if reply.error:
         kind, detail = reply.error, reply.detail
+    elif resource_of is not None:
+        kind, detail = classify_layer(body, resource_of)
     elif service_kind == IMAGE_SERVER:
         # The content type is quoted in the detail, so scrub it before the cut.
         kind, detail = classify_image(scrub(reply.ctype or "", token), body,
@@ -395,16 +421,17 @@ def check_target(url, token):
 
 
 class Probe(object):
-    """One request shape: a layer query, or an image export view.
+    """One request shape: a layer query, a layer resource, or an export view.
 
     A view is asked of `endpoint`: exportImage on an image service, export on
     a map service that cannot be queried.
     """
 
     def __init__(self, name, layer=None, bbox=None, wkid=None,
-                 endpoint="exportImage"):
+                 endpoint="exportImage", resource=False):
         self.name = name
         self.layer = layer
+        self.resource = resource
         self.bbox = bbox
         self.wkid = wkid
         self.endpoint = endpoint
@@ -483,25 +510,44 @@ def can_query(doc):
     return "data" in [c.strip().lower() for c in capabilities.split(",")]
 
 
-def build_plan(service_kind, doc, wanted):
-    """(probes, reason). An empty plan carries the reason nothing can be probed."""
+def resource_probes(ids):
+    return [Probe("layer %d resource" % i, layer=i, resource=True)
+            for i in ids]
+
+
+def build_plan(service_kind, doc, wanted, resources=False):
+    """(probes, reason). An empty plan carries the reason nothing can be probed.
+
+    A layer resource probe asks for the layer's own description. A map
+    service that cannot be queried gets one for each layer next to its two
+    export views, because an export alone cannot see a layer that failed to
+    load. With `resources`, every other layer is read before it is queried.
+    """
     if service_kind == IMAGE_SERVER:
         return views_from_root(doc)
+    ids = pick_layers(doc, wanted)
     if service_kind == MAP_SERVER and not can_query(doc):
         # With no extent to draw there is nothing to export, and the layers
         # are queried as for any other map service.
         views, _ = views_from_root(doc, "export")
         if views:
-            return views, ""
-    ids = pick_layers(doc, wanted)
+            return views + resource_probes(ids), ""
     if not ids:
         return [], "the service lists no layer to query"
-    return [Probe("layer %d" % i, layer=i) for i in ids], ""
+    probes = []
+    for i in ids:
+        if resources:
+            probes += resource_probes([i])
+        probes.append(Probe("layer %d" % i, layer=i))
+    return probes, ""
 
 
 def probe_url(base, probe, nonce=None):
     """The request for one probe. `nonce` varies the URL for each round."""
-    if probe.layer is not None:
+    if probe.resource:
+        url = "%s/%d" % (base, probe.layer)
+        params = [("f", "json")]
+    elif probe.layer is not None:
         url = "%s/%d/query" % (base, probe.layer)
         params = [("where", "1=1"), ("outFields", "*"),
                   ("returnGeometry", "false"), ("resultRecordCount", "1"),
@@ -816,7 +862,8 @@ def sample_target(result, rounds, fetch, bust, min_bytes, token, stop_on_fail):
             result.requests += 1
             # A view is judged on image bytes, whatever the service kind.
             kind = IMAGE_SERVER if probe.layer is None else result.target.kind
-            stat.add(judge(kind, reply, min_bytes, token))
+            stat.add(judge(kind, reply, min_bytes, token,
+                           probe.layer if probe.resource else None))
         if stop_on_fail and any(s.failed for s in result.stats):
             break
 
@@ -835,8 +882,9 @@ def survey(targets, options, fetch, stop_on_fail=False):
         if failure:
             result.root = failure
         else:
-            result.plan, result.reason = build_plan(target.kind, doc,
-                                                    options["layers"])
+            result.plan, result.reason = build_plan(
+                target.kind, doc, options["layers"],
+                options.get("resources", False))
         results.append(result)
     planned = sum(len(r.plan) * options["rounds"] for r in results)
     sent = sum(r.requests for r in results)
@@ -1039,10 +1087,11 @@ def _assertions(tmp, passed, failed, stubs):
         return script
 
     def opts(rounds=3, needed=1, layers=(), bust=False, min_bytes=1000,
-             max_requests=100000, token=None):
+             max_requests=100000, token=None, resources=False):
         return {"rounds": rounds, "needed": needed, "layers": list(layers),
                 "bust": bust, "min_bytes": min_bytes,
-                "max_requests": max_requests, "token": token}
+                "max_requests": max_requests, "token": token,
+                "resources": resources}
 
     def target(stub, path, kind=MAP_SERVER, tier=None):
         return Target(stub.url(path), kind, tier)
@@ -1972,12 +2021,14 @@ def _assertions(tmp, passed, failed, stubs):
             return {"body": json.dumps({
                 "capabilities": "Map", "fullExtent": EXTENT,
                 "layers": [{"id": 0, "subLayerIds": None}]}).encode()}
+        if path.endswith("/MapServer/0"):
+            return {"body": json.dumps({"id": 0, "name": "L0"}).encode()}
         return {"body": PNG, "ctype": "image/png"}
     stub = serve(drawn_only)
     res = survey([target(stub, "/draw/MapServer")], opts(rounds=2),
                  make_fetcher(None, 5))[0]
     asked = [r for r in stub.requests if r[0].endswith("/export")]
-    check(res.verdict == PASS and res.requests == 5 and len(asked) == 4
+    check(res.verdict == PASS and res.requests == 7 and len(asked) == 4
           and not any(r[0].endswith("query") for r in stub.requests)
           and all(r[1]["format"] == "png" and r[1]["f"] == "image"
                   and r[1]["size"] == "400,400" for r in asked),
@@ -1988,6 +2039,162 @@ def _assertions(tmp, passed, failed, stubs):
           == ["layer 4"],
           "a map service without Data and without an extent is still queried"
           ", as before  <-- pinned defect")
+
+    # ---- invalid layers. A layer that the root lists can still fail to load.
+    # An export cannot see it, so a service that is not queried reads the
+    # layer's own resource, and any service does with --layer-resources.
+    layer_doc = json.dumps({"id": 1, "name": "L1", "type": "Feature Layer",
+                            "capabilities": "Map,Query,Data"}).encode()
+    check(classify_layer(layer_doc, 1)[0] == OK
+          and classify_layer(layer_doc, 0)[0] == BAD_LAYER
+          and classify_layer(b'{"name": "x"}', 1)[0] == BAD_LAYER
+          and classify_layer(b'{"id": true}', 1)[0] == BAD_LAYER
+          and classify_layer(b'{"id": "1"}', 1)[0] == BAD_LAYER,
+          "a layer resource passes only when its id is the layer asked for  "
+          "<-- pinned defect")
+    check(classify_layer(ERR, 1)[0] == SERVER_ERROR
+          and classify_layer(HTML, 1)[0] == NOT_JSON
+          and classify_layer(b"[]", 1)[0] == NOT_JSON,
+          "a layer resource that is an error, a page or not an object fails")
+    check(judge(MAP_SERVER, Reply(503, "application/json", layer_doc), 1000,
+                None, 1)[0] == HTTP_STATUS
+          and judge(MAP_SERVER, Reply(200, "application/json", layer_doc),
+                    1000, None, 1)[0] == OK,
+          "a good layer resource under HTTP 503 fails, and the status never "
+          "passes it")
+    echoed = json.dumps({"error": {"code": 498, "message":
+                                   "bad token SECRET123"}}).encode()
+    check("SECRET123" not in judge(MAP_SERVER, Reply(200, "application/json",
+                                                    echoed), 1000,
+                                   "SECRET123", 1)[1],
+          "a token echoed by a failing layer resource is removed from the "
+          "detail")
+
+    doc3 = {"layers": [{"id": 0}, {"id": 1}, {"id": 2, "subLayerIds": [3]},
+                       {"id": 3}]}
+    names = [p.name for p in build_plan(MAP_SERVER, doc3, [], True)[0]]
+    check(names == ["layer 0 resource", "layer 0", "layer 1 resource",
+                    "layer 1", "layer 3 resource", "layer 3"]
+          and [p.name for p in build_plan(MAP_SERVER, doc3, [])[0]]
+          == ["layer 0", "layer 1", "layer 3"]
+          and [p.name for p in build_plan(FEATURE_SERVER, doc3, [1],
+                                          True)[0]]
+          == ["layer 1 resource", "layer 1"],
+          "the layer resources are planned only on request, and --layers "
+          "narrows them")
+    check([p.name for p in build_plan(IMAGE_SERVER, {"extent": EXTENT}, [],
+                                      True)[0]]
+          == ["view overview", "view detail"],
+          "an ImageServer has no layer, so --layer-resources adds nothing")
+    check(probe_url("http://h/s/MapServer", build_plan(
+        MAP_SERVER, doc3, [], True)[0][0], 4)
+          == "http://h/s/MapServer/0?f=json&_svcsmoke=4",
+          "a layer resource request is the layer URL with f=json and no "
+          "query")
+
+    export_doc = json.dumps({
+        "capabilities": "Map", "fullExtent": EXTENT,
+        "layers": [{"id": 0}, {"id": 1}, {"id": 2}]}).encode()
+
+    def drawn_pool(m, bad, rng, wrong_id=False):
+        """A Map-only service on m instances whose first `bad` fail layer 1's
+        resource while every export still draws."""
+        def script(path, params, headers):
+            if path.endswith("/MapServer"):
+                return {"body": export_doc}
+            if path.endswith("/export"):
+                return {"body": PNG, "ctype": "image/png"}
+            layer = int(path.rsplit("/", 1)[1])
+            if layer == 1 and int(rng.random() * m) < bad:
+                return {"body": json.dumps({"id": 9}).encode() if wrong_id
+                        else ERR}
+            return {"body": json.dumps({"id": layer}).encode()}
+        return script
+    stub = serve(drawn_pool(8, 2, random.Random(5)))
+    res = survey([target(stub, "/dp/MapServer")], opts(rounds=17, needed=17),
+                 make_fetcher(None, 5))[0]
+    by_name = dict((s.name, s) for s in res.stats)
+    check(res.verdict == FAIL and exit_code([res]) == 1
+          and by_name["layer 1 resource"].failed > 0
+          and by_name["layer 1 resource"].kinds == {SERVER_ERROR:
+                                                    by_name["layer 1 "
+                                                            "resource"].failed}
+          and by_name["layer 0 resource"].failed == 0
+          and by_name["view overview"].failed == 0
+          and by_name["view detail"].failed == 0
+          and res.requests == 1 + 17 * 5,
+          "a layer that fails to load on 2 of 8 instances fails a map service "
+          "whose export still draws  <-- pinned defect")
+    lines = describe([res], {"rounds": 17, "needed": 17, "fraction": 0.25,
+                             "faulty": "2/8", "max_miss": 0.01, "bust": True,
+                             "rounds_note": ""})
+    check(any(line.startswith("     layer 1 resource: ") and "SERVER_ERROR"
+              in line for line in lines),
+          "the report names the layer whose resource failed")
+    stub = serve(drawn_pool(8, 8, random.Random(5), wrong_id=True))
+    res = survey([target(stub, "/dw/MapServer")], opts(rounds=2),
+                 make_fetcher(None, 5))[0]
+    check(res.verdict == FAIL and stat(res, 3).name == "layer 1 resource"
+          and stat(res, 3).kinds == {BAD_LAYER: 2}
+          and "has id 9" in first(res, 3)[1],
+          "a resource that describes another layer fails as BAD_LAYER")
+    stub = serve(drawn_pool(8, 8, random.Random(5)))
+    res = survey([target(stub, "/dl/MapServer")], opts(rounds=2, layers=[0]),
+                 make_fetcher(None, 5))[0]
+    check(res.verdict == PASS
+          and [s.name for s in res.stats] == ["view overview", "view detail",
+                                              "layer 0 resource"],
+          "--layers leaves a failing layer resource out of a map service "
+          "probed through its export")
+
+    def broken_layer(path, params, headers):
+        if path.endswith("/MapServer"):
+            return {"body": map_root(((0, None), (1, None)))}
+        if path.endswith("/MapServer/1"):
+            return {"body": ERR}
+        if path.endswith("/query"):
+            return {"body": GOOD}
+        return {"body": json.dumps({"id": int(path.rsplit("/", 1)[1])}
+                                   ).encode()}
+    stub = serve(broken_layer)
+    res = survey([target(stub, "/bl/MapServer")], opts(rounds=2),
+                 make_fetcher(None, 5))[0]
+    plain = [r[0] for r in stub.requests]
+    check(res.verdict == PASS and res.requests == 5
+          and not any(p.endswith("/MapServer/0") or p.endswith("/MapServer/1")
+                      for p in plain),
+          "without --layer-resources a queried map service reads no layer "
+          "resource")
+    stub = serve(broken_layer)
+    res = survey([target(stub, "/bl/MapServer")],
+                 opts(rounds=2, resources=True), make_fetcher(None, 5))[0]
+    check(res.verdict == FAIL and res.requests == 9
+          and [s.failed for s in res.stats] == [0, 0, 2, 0]
+          and stat(res, 2).name == "layer 1 resource",
+          "with --layer-resources a layer whose resource fails while its "
+          "query still reads is FAILED  <-- pinned defect")
+    raises(lambda: survey([target(stub, "/bl/MapServer")],
+                          opts(rounds=2, resources=True, max_requests=8),
+                          make_fetcher(None, 5)),
+           "the layer resource requests count against --max-requests")
+
+    code, out, err = run([stub.url("/bl/MapServer"), "--layer-resources",
+                          "--rounds", "2"])
+    check(code == 1 and "layer 1 resource: 2 of 2 failed" in out,
+          "--layer-resources on the command line fails the broken layer")
+    code, out, err = run([stub.url("/bl/MapServer"), "--rounds", "2",
+                          "--layers", "0"])
+    check(code == 3 and "resource" not in out,
+          "a run without the flag reads no layer resource")
+    csv_path = os.path.join(tmp, "layers.csv")
+    code, out, err = run([stub.url("/bl/MapServer"), "--layer-resources",
+                          "--rounds", "2", "--out", csv_path, "--apply"])
+    with open(csv_path, encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    check(code == 1 and [r["probe"] for r in rows] == [
+        "layer 0 resource", "layer 0", "layer 1 resource", "layer 1"]
+          and rows[2]["kinds"] == "SERVER_ERROR:2",
+          "the report file has one row for each layer resource probe")
 
     # A gate that has polled must still print nothing to stdout before a
     # usage error.
@@ -2428,8 +2635,15 @@ def _parse(argv):
     ap.add_argument("--layers",
                     help="comma-separated layer ids to query instead of "
                          "every layer. Use it to leave out a layer that is "
-                         "meant to be empty. Ignored for an ImageServer and "
-                         "for a map service probed through its export.")
+                         "meant to be empty. Ignored for an ImageServer. For "
+                         "a map service probed through its export it picks "
+                         "the layer resources that are read.")
+    ap.add_argument("--layer-resources", dest="layer_resources",
+                    action="store_true",
+                    help="also read each layer's own description before it "
+                         "is queried, and fail a layer whose description is "
+                         "an error or names another layer. A map service "
+                         "probed through its export always does this.")
     ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
                     help="seconds to wait for one response (default %g)"
                          % DEFAULT_TIMEOUT)
@@ -2596,7 +2810,8 @@ def _run(argv):
     rounds = args.rounds or needed
     options = {"rounds": rounds, "needed": needed, "layers": layers,
                "bust": args.bust_cache, "min_bytes": args.min_image_bytes,
-               "max_requests": args.max_requests, "token": token}
+               "max_requests": args.max_requests, "token": token,
+               "resources": args.layer_resources}
     context = {"rounds": rounds, "needed": needed, "fraction": fraction,
                "faulty": args.faulty.replace(" ", ""),
                "max_miss": args.max_miss, "bust": args.bust_cache,

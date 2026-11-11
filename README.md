@@ -27,6 +27,14 @@ in the body. A check that reads the status passes an error. So this tool passes 
 evidence: a feature in the body of a query, or image bytes in the body of an export. The status is
 recorded on the first failure of each probe and on a failed service root, and it never decides.
 
+The fourth trap is a layer that did not load. The service starts. Its root lists every layer, and
+so does the map. One layer was published against a data source that this machine cannot open, so
+a request for that layer returns an error or a page, and only on the instances that failed to load
+it. An export still draws, because a map with a missing layer is still a map. A check that
+exports the map, or that reads the list of layers, reports a healthy service. So this tool asks
+each layer for its own data, on every round, and names the layer that failed. Where a layer cannot
+be queried, it asks for the layer's own description instead (see "A layer that did not load").
+
 ```
 $ python svcsmoke.py --self-test
 svcsmoke self-test: loopback stub only, no network, no credentials
@@ -49,6 +57,9 @@ PASS  a prefix of a flag is refused, not read as the flag: --ap  <-- pinned defe
 PASS  a token the server echoes back is removed from the screen and from the report  <-- pinned defect
 PASS  a 251 character token echoed in an error message is removed whole, not cut to a prefix first  <-- pinned defect
 PASS  a map service without Data is probed through export as image bytes, never through a layer query  <-- pinned defect
+PASS  a layer resource passes only when its id is the layer asked for  <-- pinned defect
+PASS  a layer that fails to load on 2 of 8 instances fails a map service whose export still draws  <-- pinned defect
+PASS  with --layer-resources a layer whose resource fails while its query still reads is FAILED  <-- pinned defect
 PASS  and it never probes the tier being restarted or any tier after it  <-- pinned defect
 PASS  a gate does not open on an undersampled pass  <-- pinned defect
 ...
@@ -59,10 +70,10 @@ PASS  a token echoed in the Content-Type header is removed before the type is cu
 ...
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-269 assertions, 0 failed
+286 assertions, 0 failed
 ```
 
-The full run prints all 269 assertions. Each `...` line above is where this block is cut.
+The full run prints all 286 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -121,7 +132,7 @@ git clone https://github.com/uhsear/svcsmoke.git
 
 The self-test starts small HTTP servers on `127.0.0.1` and sends them requests. It needs no
 network and no credentials. It takes about 9 seconds on Windows (Python 3.13) and 3 seconds on
-Linux (Python 3.12), because a few cases wait on a timeout. It prints the same 269
+Linux (Python 3.12), because a few cases wait on a timeout. It prints the same 286
 assertions on Windows (Python 3.13.2), on Python 3.9.25 and on Ubuntu (Python 3.12.3). All three
 outputs are identical line for line, apart from the line endings.
 `coverage run --branch svcsmoke.py --self-test` reports 100 percent of lines and branches.
@@ -138,6 +149,7 @@ python svcsmoke.py URL1 URL2 URL3
 python svcsmoke.py URL --faulty 2/8 --max-miss 0.01
 python svcsmoke.py URL --rounds 8
 python svcsmoke.py URL --layers 0,3
+python svcsmoke.py URL --layer-resources
 python svcsmoke.py URL --out report.csv --apply
 python svcsmoke.py --tiers tiers.txt --before app --wait 600
 ```
@@ -148,7 +160,8 @@ python svcsmoke.py --tiers tiers.txt --before app --wait 600
 | `--faulty` | `1/4` | The smallest share of instances with a fault that you want to catch, as K/M. `2/8` is the same share. |
 | `--max-miss` | `0.01` | The largest chance that a run passes when that share is faulty. |
 | `--rounds` | the fewest that meet `--max-miss` | Rounds per probe. A clean run with fewer rounds ends in UNDERSAMPLED. |
-| `--layers` | every layer that is not a group | Comma-separated layer ids to query. Use it to leave out a layer that is meant to be empty. An ImageServer, and a map service probed through its export, ignore it. An empty value is a usage error. |
+| `--layers` | every layer that is not a group | Comma-separated layer ids to query. Use it to leave out a layer that is meant to be empty. An ImageServer ignores it. On a map service probed through its export it picks the layer resources that are read. An empty value is a usage error. |
+| `--layer-resources` | off | Also read each layer's own description before it is queried, and fail a layer whose description is an error, a page, or names another layer. A map service that cannot be queried always does this. |
 | `--timeout` | `30` | Seconds to wait for one response. At most 86400. |
 | `--min-image-bytes` | `1000` | An image smaller than this counts as blank. A guess; see Limits. |
 | `--bust-cache` | off | Add a different throwaway parameter to each round. Without it a PASS says that no cache was ruled out. |
@@ -171,9 +184,9 @@ with exit 64 instead of being read as `--apply`, `--ou` is refused instead of `-
 ```
 $ python svcsmoke.py http://127.0.0.1:8809/arcgis/rest/services/Healthy/MapServer --ap
 usage: svcsmoke.py [-h] [--faulty FAULTY] [--max-miss MAX_MISS]
-                   [--rounds ROUNDS] [--layers LAYERS] [--timeout TIMEOUT]
-                   [--min-image-bytes MIN_IMAGE_BYTES] [--bust-cache]
-                   [--max-requests MAX_REQUESTS] [--tiers TIERS]
+                   [--rounds ROUNDS] [--layers LAYERS] [--layer-resources]
+                   [--timeout TIMEOUT] [--min-image-bytes MIN_IMAGE_BYTES]
+                   [--bust-cache] [--max-requests MAX_REQUESTS] [--tiers TIERS]
                    [--before BEFORE] [--wait WAIT] [--interval INTERVAL]
                    [--out OUT] [--apply] [--self-test]
                    [URL ...]
@@ -314,13 +327,15 @@ Service/Layer)][querymap], [Export Map][exportmap]). By those pages, a map servi
 `Map` alone draws maps and should refuse every layer query. A layer probe would call it failed. So when the root's
 `capabilities` string leaves out `Data` and the root has an extent, the tool asks `export` for the
 same two views as for an ImageServer (`format=png`, because `jpgpng` is an `exportImage` format) and
-judges them on image bytes. The root lists one layer here, so 2 probes means the two views:
+judges them on image bytes. It also reads each layer's own description, because an export cannot
+see a layer that failed to load (next section). The root lists one layer here, so 3 probes means
+the two views and that layer's description:
 
 ```
-$ python svcsmoke.py http://127.0.0.1:8809/arcgis/rest/services/Draw/MapServer
+$ python svcsmoke.py http://127.0.0.1:8830/arcgis/rest/services/Draw/MapServer
 svcsmoke: 1 target(s), 17 round(s) per probe (the fewest that meet --max-miss)
 sampling: 17 round(s) miss a fault on 1/4 of the instances with probability 0.0075 (limit 0.0100), if each request lands on a random instance
-1. PASS         http://127.0.0.1:8809/arcgis/rest/services/Draw/MapServer  2 probe(s), 35 request(s)
+1. PASS         http://127.0.0.1:8830/arcgis/rest/services/Draw/MapServer  3 probe(s), 52 request(s)
 
 VERDICT: PASS. Every probe returned a feature or image bytes on all 17 round(s). That bounds the chance of missing a fault on 1/4 of the instances at 0.0075. It says nothing about a smaller share. Cache busting was off, so a cache in front of the server could have answered repeated requests.
 $ echo $?
@@ -332,6 +347,69 @@ check Esri's own error text for a missing `Data` capability, which I did not ver
 answers with an invented error body. Another server may list a map service as `Map,Query`, as
 restfake does, so the tool switches to `export` only when the root also gives an extent. With no
 extent it queries the layers as for any other map service.
+
+**A layer that did not load.** Esri's pages for the map service and for a layer or table
+describe the layer resource and its `id`, `name`, `type` and `capabilities`. They do not say what a
+layer that failed to load returns, either from its resource or from a query ([Map
+Service][mapservice], [Layer or table][layer], read on 2026-11-10). I could not verify that, so the
+tool does not depend on it. It fails any answer that is not the layer's own description. That is an
+error property, a page, JSON that is not an object, or an `id` that is missing or is not the layer
+asked for (`BAD_LAYER`). The query that every layer already gets covers a service that can be
+queried, so on that path this check is off by default and `--layer-resources` turns it on: each
+round then reads the layer's description and then queries it, and a layer whose description fails
+while its query still returns a feature is FAILED. A map service that cannot be queried has no
+query to fail, so it reads each layer's description by default, next to the two export views. The
+`Drawfault` stub is such a service. Its export always draws, and layer 1 fails to load on 2 of 8
+pretend instances:
+
+```
+$ python svcsmoke.py http://127.0.0.1:8830/arcgis/rest/services/Drawfault/MapServer
+svcsmoke: 1 target(s), 17 round(s) per probe (the fewest that meet --max-miss)
+sampling: 17 round(s) miss a fault on 1/4 of the instances with probability 0.0075 (limit 0.0100), if each request lands on a random instance
+1. FAIL         http://127.0.0.1:8830/arcgis/rest/services/Drawfault/MapServer  4 probe(s), 69 request(s)
+     layer 1 resource: 4 of 17 failed (23.5%): SERVER_ERROR x4. First: error property: Unable to complete operation. (code 500) (HTTP 200, recorded only)
+
+VERDICT: FAILED. 1 target(s) returned no feature or image on at least one request. They are not healthy, whatever their state says.
+$ echo $?
+1
+```
+
+The two views passed on all 17 rounds, so a check that only exported the map would have called this
+service healthy. `--layers 0` leaves layer 1 out, and the same service then passes (3 probes, 52
+requests; run on a fresh stub). On a queried service the flag adds a second request for each
+layer. The `Pool` stub fails layer 1 on 2 of 8 instances, in its description and in its query:
+
+```
+$ python svcsmoke.py http://127.0.0.1:8831/arcgis/rest/services/Pool/MapServer --layer-resources
+svcsmoke: 1 target(s), 17 round(s) per probe (the fewest that meet --max-miss)
+sampling: 17 round(s) miss a fault on 1/4 of the instances with probability 0.0075 (limit 0.0100), if each request lands on a random instance
+1. FAIL         http://127.0.0.1:8831/arcgis/rest/services/Pool/MapServer  4 probe(s), 69 request(s)
+     layer 1 resource: 5 of 17 failed (29.4%): SERVER_ERROR x5. First: error property: Unable to complete operation. (code 500) (HTTP 200, recorded only)
+     layer 1: 6 of 17 failed (35.3%): SERVER_ERROR x6. First: error property: Unable to complete operation. (code 500) (HTTP 200, recorded only)
+
+VERDICT: FAILED. 1 target(s) returned no feature or image on at least one request. They are not healthy, whatever their state says.
+$ echo $?
+1
+```
+
+Against restfake (`restfake.py --port 8873 --image-server --layers 3 --count-fault 1 --apply`), whose
+layer resources have the shape Esri documents, a healthy service passes with 6 probes and 103
+requests, and its `id` values match:
+
+```
+$ python svcsmoke.py http://127.0.0.1:8873/rest/services/Basemap/MapServer --layer-resources
+svcsmoke: 1 target(s), 17 round(s) per probe (the fewest that meet --max-miss)
+sampling: 17 round(s) miss a fault on 1/4 of the instances with probability 0.0075 (limit 0.0100), if each request lands on a random instance
+1. PASS         http://127.0.0.1:8873/rest/services/Basemap/MapServer  6 probe(s), 103 request(s)
+
+VERDICT: PASS. Every probe returned a feature or image bytes on all 17 round(s). That bounds the chance of missing a fault on 1/4 of the instances at 0.0075. It says nothing about a smaller share. Cache busting was off, so a cache in front of the server could have answered repeated requests.
+$ echo $?
+0
+```
+
+The self-test covers the same paths against its own stub: the error, the page, the wrong `id`, a
+good description under HTTP 503, a token echoed by a failing description, the request budget, the
+report rows, and the layer that fails on 2 of 8 instances.
 
 **An ImageServer.** The tool asks `exportImage` for a 400 by 400 image in two views. One view is
 the whole extent of the service. The other is a window 1/100 as wide at its centre, so a fault
@@ -673,7 +751,7 @@ this file next to `svcsmoke.py` as `stub.py`. It serves pretend services on 8 pr
 Run it as `python stub.py 8803 33`, where the second number seeds which requests hit a bad
 instance. The `Pool` service has 2 of 8 instances failing layer 1. `Imagery` has 2 of 8 returning
 an HTML page for `exportImage`. `Draw` is a map service published with the `Map` capability
-only.
+only. `Drawfault` is the same with a second layer that fails to load on 2 of 8 instances.
 
 Each output in this README came from a stub started for that example. Examples that ran one after
 another against the same port shared a stub, and ran in the order they appear. The gate examples
@@ -723,16 +801,23 @@ def script(path, params, headers):
         if name == "Secure" and "X-Esri-Authorization" not in headers:
             return {"body": json.dumps({"error": {"code": 499, "details": [],
                     "message": "Token Required"}}).encode()}
-        if name == "Draw":      # published with the Map capability only
+        if name in ("Draw", "Drawfault"):   # the Map capability only
             return {"body": json.dumps({"capabilities": "Map",
                                         "fullExtent": EXTENT,
-                                        "layers": LAYERS[:1]}).encode()}
+                                        "layers": LAYERS[:1] if name == "Draw"
+                                        else LAYERS}).encode()}
         if name == "Empty":
             return {"body": json.dumps({"layers": [
                 {"id": 0, "name": "group", "subLayerIds": [1]}]}).encode()}
         return {"body": json.dumps({"layers": LAYERS}).encode()}
+    if parts[-1].isdigit():     # a layer resource: the layer describes itself
+        layer = int(parts[-1])
+        if name in ("Drawfault", "Pool") and layer == 1 and instance < 2:
+            return {"body": BAD}
+        return {"body": json.dumps({"id": layer, "name": "L%d" % layer,
+                                    "type": "Feature Layer"}).encode()}
     layer = int(parts[-2])
-    if name == "Draw":      # no Data capability, so a layer query is refused
+    if name in ("Draw", "Drawfault"):      # no Data capability, so a layer query is refused
         return {"body": BAD}
     return {"body": BAD if name == "Pool" and layer == 1 and instance < 2
             else GOOD}
@@ -807,9 +892,16 @@ $ echo $?
   tables ends as NOTHING with exit 4.
 - **The root lists no layer type.** A layer that cannot be queried, such as a raster layer, fails
   its probe until you leave it out with `--layers`. I did not check this against a live server.
-- **Map services without Data.** The tool probes such a service through `export`, which shows
-  that it draws and does not show that its data reads. `--layers` has no effect on it. The
-  switch rests on the two Esri pages cited above, and I did not test it against a live server.
+- **Map services without Data.** The tool probes such a service through `export` and through
+  each layer's description. That shows it draws and that each layer describes itself. It does not
+  show that the data reads. `--layers` picks the descriptions that are read and does not change
+  the views. The switch rests on the two Esri pages cited above, and I did not test it against a
+  live server.
+- **Layer resources.** Esri does not document what a layer that failed to load returns, so the
+  check fails every answer that is not the layer's own `id`. Whether a live server answers a broken
+  layer that way, or describes it normally and fails only the query, I did not verify, and no
+  live server was available. The query on a queried service does not depend on that.
+  Stand-alone tables get no description probe either.
 - **No cache control by default.** Without `--bust-cache` a cache or CDN in front of the server
   can answer every round from one cached reply. The printed miss probability then does not apply.
 - **The miss probability** holds only for a fault that fails every request on a bad instance.
@@ -834,7 +926,7 @@ $ echo $?
 - **CI.** Read the last line of the self-test (`N assertions, 0 failed`) as well as the exit
   code. A CI step must require the text `0 failed`, because a self-test that printed nothing
   would also exit 0. A red self-test exits 1, the same code as a failed service.
-- **Mutation sweep.** I ran 760 mutants of the non-test code of this version, on Linux with Python
+- **Mutation sweep.** I ran 760 mutants of the non-test code of the version before `--layer-resources`, on Linux with Python
   3.12.3. The sweep is a scratch script and is not shipped. It flips comparisons, boolean
   operators, constants, branches and return values. The self-test killed 735 and 25 survived.
   Eleven survivors change only how long a quoted text is cut. Two change a read cap and a split
@@ -842,7 +934,8 @@ $ echo $?
   `rounds_needed`. Five replace the return value of `main()` or the `__name__` guard, so the
   self-test never runs, and that is why a CI step must require `0 failed`. The same sweep run on
   Windows, while other loopback jobs ran, gave false kills from port exhaustion (errno 10048).
-  Only the Linux result is valid.
+  Only the Linux result is valid. I did not re-run the sweep on the code that
+  `--layer-resources` added.
 - **The estimate in `rounds_needed`.** The logarithm only sets where the search starts. The loop
   that follows decides the answer.
 - **Huge numbers.** A `--rounds` above about 1e308 ends in exit 70 against a target with no
@@ -931,6 +1024,7 @@ Other single-file tools in this portfolio that pair with this one:
 [querymap]: https://developers.arcgis.com/rest/services-reference/enterprise/query-map-service-layer/
 [queryfeature]: https://developers.arcgis.com/rest/services-reference/enterprise/query-feature-service-layer/
 [mapservice]: https://developers.arcgis.com/rest/services-reference/enterprise/map-service/
+[layer]: https://developers.arcgis.com/rest/services-reference/enterprise/layer-table/
 [imageservice]: https://developers.arcgis.com/rest/services-reference/enterprise/image-service/
 [exportimage]: https://developers.arcgis.com/rest/services-reference/enterprise/export-image/
 [errors]: https://developers.arcgis.com/rest/services-reference/enterprise/error-handling-with-sync-operations/
