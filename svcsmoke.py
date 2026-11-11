@@ -401,7 +401,7 @@ def check_target(url, token):
     # No message below quotes a URL that holds a password. A URL typed without
     # a scheme (user:pass@host/...) has no user name for urlsplit to find, so
     # any "@" keeps the URL out of the message.
-    shown = "the URL" if "@" in url else scrub(tidy(url, 60), None)
+    shown = "the URL" if "@" in url else tidy(scrub(url, token), 60)
     if not all(33 <= ord(c) < 127 for c in url):
         raise ValueError("a URL may hold only printable ASCII characters and "
                          "no spaces. Percent-encode anything else")
@@ -549,21 +549,27 @@ def build_plan(service_kind, doc, wanted, resources=False):
     if service_kind == IMAGE_SERVER:
         return views_from_root(doc)
     ids = pick_layers(doc, wanted)
-    if service_kind == MAP_SERVER and not can_query(doc):
-        # With no extent to draw there is nothing to export, and the layers
-        # are queried as for any other map service.
+    by_resource = described_only(doc)
+    # A map service whose layers cannot all be queried is also exported, or a
+    # description alone would pass it. With no extent to draw there is nothing
+    # to export, and the layers are queried as for any other map service.
+    if service_kind == MAP_SERVER and (not can_query(doc) or (
+            ids and all(i in by_resource for i in ids))):
         views, _ = views_from_root(doc, "export")
         if views:
             return views + resource_probes(ids), ""
     if not ids:
         return [], "the service lists no layer to query"
     probes = []
-    by_resource = described_only(doc)
     for i in ids:
         if resources or i in by_resource:
             probes += resource_probes([i])
         if i not in by_resource:
             probes.append(Probe("layer %d" % i, layer=i))
+    if all(p.resource for p in probes):
+        return [], ("no layer is known to return a feature and the service "
+                    "root has no extent to export, so a layer description "
+                    "alone would pass it")
     return probes, ""
 
 
@@ -755,8 +761,9 @@ def describe(results, context):
                      "of the instances, over the limit of %.4f. Run at least "
                      "%d." % (rounds, miss, context["faulty"], limit, needed))
     else:
-        lines.append("VERDICT: PASS. Every probe returned a feature or image "
-                     "bytes on all %d round(s). That bounds the chance of "
+        lines.append("VERDICT: PASS. Every probe returned a feature, image "
+                     "bytes or a valid layer description on all %d round(s). "
+                     "That bounds the chance of "
                      "missing a fault on %s of the instances at %.4f. It says "
                      "nothing about a smaller share." % (rounds,
                                                          context["faulty"],
@@ -2024,6 +2031,24 @@ def _assertions(tmp, passed, failed, stubs):
               and "[token]" in err,
               "a token typed after the wrong flag is not echoed in the "
               "usage error: %s  <-- pinned defect" % argv[0].split("=")[0])
+    # Every other line main() prints from typed text goes through scrub too.
+    tok = "SECRETtok9876543210" + "Q" * 50
+    tiers_file = os.path.join(tmp, "leak_tiers.txt")
+    with open(tiers_file, "w") as handle:
+        handle.write("db: http://127.0.0.1:1/a/MapServer\n")
+    for label, argv in (
+            ("the URL", [tok]),
+            ("--layers", ["http://127.0.0.1:1/a/MapServer", "--layers", tok]),
+            ("--before", ["--tiers", tiers_file, "--before", tok]),
+            ("--tiers", ["--tiers", tok, "--before", "x"]),
+            ("--out", ["http://127.0.0.1:1/a/MapServer", "--rounds", "1",
+                       "--out", os.path.join(tmp, tok, "x.csv"), "--apply"]),
+            ("the port", ["http://127.0.0.1:" + tok + "/a/MapServer"])):
+        code, out, err = run(argv, token=tok)
+        check(code in (2, 64) and tok[:12] not in out + err
+              and tok[-12:] not in out + err and "[token]" in err,
+              "a token typed into %s is not echoed in the error line  "
+              "<-- pinned defect" % label)
     check(scrub_body(b"a SECRET b token=xyz&q=1", "SECRET")
           == b"a [token] b token=[token]&q=1"
           and scrub_body(b"plain", None) == b"plain",
@@ -2190,6 +2215,35 @@ def _assertions(tmp, passed, failed, stubs):
     check(res.verdict == FAIL and "layer 1 resource" in [
         s_.name for s_ in res.stats if s_.failed],
           "a raster layer whose resource is an error still fails the service")
+
+    # A map service whose only layers are not feature layers returns no feature
+    # to query, so a layer description alone must not pass it.
+    raster_only = {"capabilities": "Map,Query,Data", "fullExtent": EXTENT,
+                   "layers": [{"id": 0, "subLayerIds": None,
+                               "type": "Raster Layer"}]}
+    check([p.name for p in build_plan(MAP_SERVER, raster_only, [])[0]]
+          == ["view overview", "view detail", "layer 0 resource"]
+          and build_plan(MAP_SERVER, dict(raster_only, fullExtent=None),
+                         [])[0] == []
+          and "description alone" in build_plan(
+              MAP_SERVER, dict(raster_only, fullExtent=None), [])[1]
+          and build_plan(FEATURE_SERVER, raster_only, [])[0] == [],
+          "a service of only non-feature layers is exported, or probes "
+          "nothing, never passed on a description alone  <-- pinned defect")
+
+    def raster_only_script(path, params, headers):
+        if path.endswith("/MapServer"):
+            return {"body": json.dumps(raster_only).encode()}
+        if path.endswith("/MapServer/0"):
+            return {"body": json.dumps({"id": 0}).encode()}
+        return {"body": HTML, "ctype": "text/html"}
+    stub = serve(raster_only_script)
+    res = survey([target(stub, "/ras/MapServer")], opts(rounds=2),
+                 make_fetcher(None, 5))[0]
+    check(res.verdict == FAIL and "view overview" in [
+        s_.name for s_ in res.stats if s_.failed],
+          "a raster-only map service whose export returns an HTML page fails "
+          "though its layer description is valid  <-- pinned defect")
 
     doc3 = {"layers": [{"id": 0}, {"id": 1}, {"id": 2, "subLayerIds": [3]},
                        {"id": 3}]}
@@ -2815,7 +2869,7 @@ def _layer_ids(text):
         piece = piece.strip()
         if not piece.isdigit():
             raise ValueError("--layers must be comma-separated layer ids, not "
-                             "%r" % tidy(text, 40))
+                             "%r" % tidy(scrub(text, _env_token()), 40))
         if int(piece) not in ids:
             ids.append(int(piece))
     return ids
@@ -2850,7 +2904,7 @@ def _tolerate_odd_characters():
 
 
 def _usage(message):
-    print("error: %s" % message, file=sys.stderr)
+    print(scrub("error: %s" % message, _env_token()), file=sys.stderr)
     return 64
 
 
@@ -2935,7 +2989,7 @@ def _run(argv):
     except ValueError as exc:
         return _usage(str(exc))
     except (IOError, OSError) as exc:
-        print("error: %s" % exc, file=sys.stderr)
+        print(scrub("error: %s" % exc, token), file=sys.stderr)
         return 2
 
     rounds = args.rounds or needed
@@ -2975,16 +3029,16 @@ def _run(argv):
     if gate:
         print(_gate_line(args.before, 2 if failure else code))
     if failure:
-        print("error: could not write %s: %s" % (args.out, failure),
-              file=sys.stderr)
+        print(scrub("error: could not write %s: %s" % (args.out, failure),
+                    token), file=sys.stderr)
         return 2
 
     if args.out:
         if args.apply:
-            print("\nwrote %s" % args.out)
+            print(scrub("\nwrote %s" % args.out, token))
         else:
-            print("\nCheck only. %s was not written. Re-run with --apply."
-                  % args.out)
+            print(scrub("\nCheck only. %s was not written. Re-run with "
+                        "--apply." % args.out, token))
     return code
 
 
