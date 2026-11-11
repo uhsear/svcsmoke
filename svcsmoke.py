@@ -277,7 +277,7 @@ def error_text(doc, token=None):
     if isinstance(error, dict) and error.get("message"):
         return "error property: %s (code %s)" % (
             tidy(scrub(str(error["message"]), token), 80),
-            tidy(str(error.get("code")), 12))
+            tidy(scrub(str(error.get("code")), token), 12))
     return "error property: %s" % tidy(scrub(str(error), token), 80)
 
 
@@ -2002,6 +2002,28 @@ def _assertions(tmp, passed, failed, stubs):
               and "[token]" in out + written,
               "a token written with %s is removed before the message is cut"
               "  <-- pinned defect" % what)
+    # error_text cut the code to 12 characters without scrubbing it.
+    code_token = "SECRETtok" + "Z" * 20
+    code_body = ('{"error": {"code": "%s", "message": "bad"}}' % "".join(
+        "\\u%04x" % ord(c) for c in code_token)).encode()
+    code_stub = serve(lambda path, params, headers: {
+        "body": map_root()} if path.endswith("/MapServer")
+        else {"body": code_body})
+    code, out, err = run([code_stub.url("/svc/MapServer"), "--rounds", "1"],
+                         token=code_token)
+    check(code == 1 and "SECRETtok" not in out + err,
+          "a token echoed in the error code with JSON escapes is removed "
+          "before the code is cut  <-- pinned defect")
+    # argparse echoes the argument it refuses, and a token typed after the
+    # wrong flag or into a numeric flag is that argument.
+    for argv in (["--token", "SECRETtok123"], ["--rounds=SECRETtok123"],
+                 ["--rounds", "SECRETtok123"]):
+        code, out, err = run([stub.url("/svc/MapServer")] + argv,
+                             token="SECRETtok123")
+        check(code == 64 and out == "" and "SECRETtok123" not in err
+              and "[token]" in err,
+              "a token typed after the wrong flag is not echoed in the "
+              "usage error: %s  <-- pinned defect" % argv[0].split("=")[0])
     check(scrub_body(b"a SECRET b token=xyz&q=1", "SECRET")
           == b"a [token] b token=[token]&q=1"
           and scrub_body(b"plain", None) == b"plain",
@@ -2709,8 +2731,18 @@ def _assertions(tmp, passed, failed, stubs):
 
 # ----------------------------------------------------------------------- cli
 
+class _Parser(argparse.ArgumentParser):
+    """argparse echoes the offending argument in its message. A token typed
+    after the wrong flag must not reach stderr, so the message is scrubbed."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(2, "%s: error: %s\n" % (
+            self.prog, scrub(message, _env_token())))
+
+
 def _parse(argv):
-    ap = argparse.ArgumentParser(
+    ap = _Parser(
         prog="svcsmoke.py",
         description="Sample each ArcGIS Server service instance repeatedly "
                     "and pass it only on features or image bytes.",

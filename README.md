@@ -70,6 +70,8 @@ PASS  a 251 character token echoed in an error message is removed whole, not cut
 ...
 PASS  a token written with a slash sent as a JSON escape is removed before the message is cut  <-- pinned defect
 PASS  a token written with every character sent as a unicode escape is removed before the message is cut  <-- pinned defect
+PASS  a token echoed in the error code with JSON escapes is removed before the code is cut  <-- pinned defect
+PASS  a token typed after the wrong flag is not echoed in the usage error: --token  <-- pinned defect
 ...
 PASS  a map service without Data is probed through export as image bytes, never through a layer query  <-- pinned defect
 ...
@@ -90,10 +92,10 @@ PASS  a token echoed in the Content-Type header is removed before the type is cu
 ...
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-292 assertions, 0 failed
+296 assertions, 0 failed
 ```
 
-The full run prints all 292 assertions. Each `...` line above is where this block is cut.
+The full run prints all 296 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -307,7 +309,9 @@ $ echo $?
 ```
 
 Two of 17 requests failed, and the tool names the layer. The stub's rate was one in four, and a
-small sample shows 2 of 17. The count is a sample, not a measurement of the pool.
+small sample shows 2 of 17. The count is a sample, not a measurement of the pool. The failure
+counts in these transcripts vary with the stub seed and with the requests the stub has already
+answered. The verdict and the probe and request totals do not.
 
 ## What counts as a pass
 
@@ -368,8 +372,8 @@ answers with an invented error body. Another server may list a map service as `M
 restfake does, so the tool switches to `export` only when the root also gives an extent. With no
 extent it queries the layers as for any other map service.
 
-**A layer that is not a feature layer.** Esri's Map Service page shows `type` and `geometryType` on
-every entry of the root `layers` list, with the value `Feature Layer` in its sample ([Map
+**A layer that is not a feature layer.** Esri's Map Service example response shows `type` and
+`geometryType` on a root `layers` entry, with the value `Feature Layer` ([Map
 Service][mapservice], read on 2026-11-10). The page shows no other value. A root entry whose
 `type` is a string other than `Feature Layer`, such as a raster layer, is not known to answer a
 query. The tool reads its own description (`layer N resource`) in each round and sends it no
@@ -544,7 +548,10 @@ The tool takes these steps so that the token reaches the server and nobody else:
   that echo a 251 character token back in an error message and in an HTML page, and in both
   escaped forms, and greps the screen and the report for it. A token that a server echoes in a `Content-Type` header is
   removed before the type is cut to 40 characters. An unexpected error and a usage error are
-  scrubbed the same way.
+  scrubbed the same way. That includes the message that argparse prints for a flag it refuses or
+  a value it cannot read, which quotes the argument. A token typed after `--token` or into
+  `--rounds` shows as `[token]` on stderr. The error code of a REST error is scrubbed before it
+  is cut to 12 characters, like the message.
 - Whitespace at either end of the token, such as the newline from a token file, is stripped. A token
   with a space, a control character or a non-ASCII character is refused at the start, and the
   message does not quote it.
@@ -919,6 +926,7 @@ $ echo $?
 - **A features list** passes when it is not empty, even if its entries are `null` or `{}`. The
   tool checks that a feature came back and not that its content is valid.
 - **A healthy layer with no features** fails its probe, by design. Leave it out with `--layers`.
+- **A group layer** is not probed itself, only its sub-layers.
 - **Stand-alone tables** in the root `tables` array are never probed. A service that holds only
   tables ends as NOTHING with exit 4.
 - **Layer types.** Esri's page shows only `Feature Layer` as a root layer `type`. Any other string
@@ -957,7 +965,7 @@ $ echo $?
 - **The self-test writes** about ten tier and report files into a temporary directory that it
   creates and removes at the end. That is the one write outside `--apply`, and it never touches a
   path that you name.
-- **One connection for every request.** The tool opens a new connection for each request. On
+- **A new connection for every request.** The tool opens a new connection for each request. On
   Windows each closed connection keeps its port in TIME_WAIT for a few minutes. A burst of runs
   can use every ephemeral port, and a request then shows `OSError (errno 10048)` as a false
   TRANSPORT failure. The self-test sends more than 600 requests to its stubs and makes the same demand. Wait a
@@ -975,16 +983,15 @@ $ echo $?
   Windows, while other loopback jobs ran, gave false kills from port exhaustion (errno 10048).
   Only the Linux result is valid. I did not re-run the sweep on the code that
   `--layer-resources`, the layer type rule and the escaped token scrub added, so the figures
-  describe an earlier version of the tool and not the one in this repository.
+  describe an earlier version of the tool and not the one in this repository. The mutation figures are not reproducible from this repository.
 - **The estimate in `rounds_needed`.** The logarithm only sets where the search starts. The loop
   that follows decides the answer.
 - **Huge numbers.** A `--rounds` above about 1e308 ends in exit 70 against a target with no
   plan. So does a root extent with an integer of more than about 308 digits. Both end with an
   `OverflowError` traceback and exit 70. Both fail closed, and neither is a finding. A `--rounds`
   that large is not a realistic input.
-- **The restfake transcripts** in this README were taken in an earlier session and were not
-  re-run after the layer type rule. The restfake root lists no layer `type`, so the plans they
-  show do not change.
+- **The restfake transcripts** in this README were re-run after the layer type rule, and every
+  line matched. The restfake root lists no layer `type`, so the plans they show did not change.
 - **A closed output pipe.** If stdout is closed early, for example by `| head -1`, the tool exits 70
   with a traceback and not with the verdict or gate code.
 - **Interrupts.** A Ctrl-C during `--wait` is not caught. The process ends with Python's own
