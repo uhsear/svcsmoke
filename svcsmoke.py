@@ -266,22 +266,28 @@ def parse_json(body):
     return doc, None
 
 
-def error_text(doc):
-    """The message of a REST error property, or a stand-in."""
+def error_text(doc, token=None):
+    """The message of a REST error property, or a stand-in.
+
+    The token is scrubbed from the decoded text before the text is cut. A
+    body that writes the token with JSON escapes passes the scrub of the raw
+    bytes, and a cut made first would leave a prefix of it.
+    """
     error = doc.get("error")
     if isinstance(error, dict) and error.get("message"):
         return "error property: %s (code %s)" % (
-            tidy(str(error["message"]), 80), tidy(str(error.get("code")), 12))
-    return "error property: %s" % tidy(str(error), 80)
+            tidy(scrub(str(error["message"]), token), 80),
+            tidy(str(error.get("code")), 12))
+    return "error property: %s" % tidy(scrub(str(error), token), 80)
 
 
-def classify_features(body):
+def classify_features(body, token=None):
     """A feature query body -> (kind, detail). OK only when it holds a feature."""
     doc, failure = parse_json(body)
     if failure:
         return failure
     if "error" in doc:
-        return SERVER_ERROR, error_text(doc)
+        return SERVER_ERROR, error_text(doc, token)
     features = doc.get("features")
     if not isinstance(features, list):
         return NO_FEATURES, "JSON with no features array"
@@ -290,7 +296,7 @@ def classify_features(body):
     return OK, ""
 
 
-def classify_layer(body, layer_id):
+def classify_layer(body, layer_id, token=None):
     """A layer resource body -> (kind, detail). OK only when it names the layer.
 
     A layer that cannot load answers with an error property or with a page, or
@@ -302,10 +308,10 @@ def classify_layer(body, layer_id):
     if failure:
         return failure
     if "error" in doc:
-        return SERVER_ERROR, error_text(doc)
+        return SERVER_ERROR, error_text(doc, token)
     if not _is_int(doc.get("id")) or doc["id"] != layer_id:
         return BAD_LAYER, "resource of layer %d has id %s" % (
-            layer_id, tidy(str(doc.get("id")), 20))
+            layer_id, tidy(scrub(str(doc.get("id")), token), 20))
     return OK, ""
 
 
@@ -346,13 +352,13 @@ def judge(service_kind, reply, min_bytes, token, resource_of=None):
     if reply.error:
         kind, detail = reply.error, reply.detail
     elif resource_of is not None:
-        kind, detail = classify_layer(body, resource_of)
+        kind, detail = classify_layer(body, resource_of, token)
     elif service_kind == IMAGE_SERVER:
         # The content type is quoted in the detail, so scrub it before the cut.
         kind, detail = classify_image(scrub(reply.ctype or "", token), body,
                                       min_bytes)
     else:
-        kind, detail = classify_features(body)
+        kind, detail = classify_features(body, token)
     if kind == OK and reply.status != 200:
         kind, detail = HTTP_STATUS, "HTTP %d with a good body" % reply.status
     return kind, tidy(scrub(detail, token), 120), reply.status
@@ -367,7 +373,7 @@ def judge_root(reply, token):
     if failure:
         return None, (failure[0], scrub(failure[1], token), reply.status)
     if "error" in doc:
-        return None, (SERVER_ERROR, scrub(error_text(doc), token),
+        return None, (SERVER_ERROR, error_text(doc, token),
                       reply.status)
     if reply.status != 200:
         return None, (HTTP_STATUS, "HTTP %d with a good body" % reply.status,
@@ -515,6 +521,23 @@ def resource_probes(ids):
             for i in ids]
 
 
+def described_only(doc):
+    """The ids of root layers that name a type other than Feature Layer.
+
+    Esri's Map Service page shows type and geometryType on each root layers
+    entry, with the value Feature Layer. Other types are not shown there. A
+    layer that does not say it is a feature layer is not known to answer a
+    query, such as a raster layer, so it is read through its own resource.
+    """
+    entries = doc.get("layers")
+    if not isinstance(entries, list):
+        return set()
+    return set(e["id"] for e in entries
+               if isinstance(e, dict) and _is_int(e.get("id"))
+               and isinstance(e.get("type"), str)
+               and e["type"].strip().lower() != "feature layer")
+
+
 def build_plan(service_kind, doc, wanted, resources=False):
     """(probes, reason). An empty plan carries the reason nothing can be probed.
 
@@ -535,10 +558,12 @@ def build_plan(service_kind, doc, wanted, resources=False):
     if not ids:
         return [], "the service lists no layer to query"
     probes = []
+    by_resource = described_only(doc)
     for i in ids:
-        if resources:
+        if resources or i in by_resource:
             probes += resource_probes([i])
-        probes.append(Probe("layer %d" % i, layer=i))
+        if i not in by_resource:
+            probes.append(Probe("layer %d" % i, layer=i))
     return probes, ""
 
 
@@ -1952,6 +1977,31 @@ def _assertions(tmp, passed, failed, stubs):
               "a %d character token echoed in %s is removed whole, not cut "
               "to a prefix first  <-- pinned defect"
               % (len(long_token), what))
+    # The raw-byte scrub misses a token that the body writes with JSON
+    # escapes. The decoded message must be scrubbed before it is cut.
+    slash_token = long_token + "/" + "ZZ" * 60
+    esc_bodies = (
+        ("a slash sent as a JSON escape", json.dumps({"error": {
+            "code": 498, "message": "Invalid token %s supplied"
+            % slash_token}}).replace("/", "\\/").encode()),
+        ("every character sent as a unicode escape", ('{"error": {"code": 498, '
+         '"message": "Invalid token %s"}}' % "".join(
+             "\\u%04x" % ord(c) for c in long_token)).encode()))
+    for what, body in esc_bodies:
+        esc_stub = serve(lambda path, params, headers, b=body: {
+            "body": map_root()} if path.endswith("/MapServer")
+            else {"body": b})
+        esc_csv = os.path.join(tmp, "esc.csv")
+        code, out, err = run([esc_stub.url("/svc/MapServer"), "--rounds",
+                              "1", "--out", esc_csv, "--apply"],
+                             token=slash_token if "slash" in what
+                             else long_token)
+        with open(esc_csv, encoding="utf-8") as handle:
+            written = handle.read()
+        check(code == 1 and long_token[11:30] not in out + err + written
+              and "[token]" in out + written,
+              "a token written with %s is removed before the message is cut"
+              "  <-- pinned defect" % what)
     check(scrub_body(b"a SECRET b token=xyz&q=1", "SECRET")
           == b"a [token] b token=[token]&q=1"
           and scrub_body(b"plain", None) == b"plain",
@@ -2069,6 +2119,55 @@ def _assertions(tmp, passed, failed, stubs):
                                    "SECRET123", 1)[1],
           "a token echoed by a failing layer resource is removed from the "
           "detail")
+
+    # ---- layer types. Esri's Map Service page shows type on each root layer
+    # entry. A layer that names a type other than Feature Layer is read
+    # through its resource, because it is not known to answer a query.
+    typed = {"layers": [{"id": 0, "type": "Feature Layer"},
+                        {"id": 1, "type": "Raster Layer"},
+                        {"id": 2, "type": " feature layer "},
+                        {"id": 3, "type": None}, {"id": 4, "type": 7},
+                        {"id": 5, "type": "Annotation Layer",
+                         "subLayerIds": [6]}, {"id": True, "type": "x"},
+                        "x"]}
+    check(described_only(typed) == set([1, 5])
+          and described_only({"layers": "x"}) == set()
+          and described_only({}) == set(),
+          "only a string type other than Feature Layer is read by resource")
+    check([p.name for p in build_plan(MAP_SERVER, typed, [])[0]]
+          == ["layer 0", "layer 1 resource", "layer 2", "layer 3", "layer 4"]
+          and [p.name for p in build_plan(FEATURE_SERVER, typed, [1, 0],
+                                          True)[0]]
+          == ["layer 1 resource", "layer 0 resource", "layer 0"],
+          "a layer of another type gets a resource probe and no query, "
+          "with or without --layer-resources")
+
+    def raster_script(raster_ok):
+        def script(path, params, headers):
+            if path.endswith("/MapServer"):
+                return {"body": json.dumps({"capabilities": "Map,Query,Data",
+                                            "layers": [
+                    {"id": 0, "subLayerIds": None, "type": "Feature Layer"},
+                    {"id": 1, "subLayerIds": None, "type": "Raster Layer"}]
+                    }).encode()}
+            if path.endswith("/MapServer/1"):
+                return {"body": json.dumps({"id": 1}).encode() if raster_ok
+                        else ERR}
+            return {"body": GOOD}
+        return script
+    stub = serve(raster_script(True))
+    res = survey([target(stub, "/ras/MapServer")], opts(rounds=2),
+                 make_fetcher(None, 5))[0]
+    check(res.verdict == PASS and res.requests == 5
+          and not any(r[0].endswith("/1/query") for r in stub.requests),
+          "a healthy map service with a raster layer in its root passes, and "
+          "the raster layer is not queried  <-- pinned defect")
+    stub = serve(raster_script(False))
+    res = survey([target(stub, "/ras/MapServer")], opts(rounds=2),
+                 make_fetcher(None, 5))[0]
+    check(res.verdict == FAIL and "layer 1 resource" in [
+        s_.name for s_ in res.stats if s_.failed],
+          "a raster layer whose resource is an error still fails the service")
 
     doc3 = {"layers": [{"id": 0}, {"id": 1}, {"id": 2, "subLayerIds": [3]},
                        {"id": 3}]}

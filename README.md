@@ -7,8 +7,8 @@ A service reads STARTED. Nothing alerts. For hours, every `exportImage` call on 
 imagery service fails. The service description answers. The admin page is green. Everything a
 check can read says the service is up, because the status says what state the service is in, and
 it does not say whether a request returns anything. Esri's service status operation returns two
-fields, `configuredState` and `realTimeState`, and neither one is the result of an export
-([Service status][status]).
+fields, `configuredState` and `realTimeState`. Its example shows them as state names, and
+neither one is the result of a request ([Service status][status]).
 
 The first fix is a sweep: ask every layer once, and run the sweep after each restart. It finds
 nothing. Say the fault sits on 2 of the 8 instances in the pool. One request is answered by one
@@ -42,38 +42,58 @@ svcsmoke self-test: loopback stub only, no network, no credentials
 PASS  2/8 and 1/4 are the same quarter of the instances
 ...
 PASS  eight rounds against a fault on 2 of 8 instances miss it 10 percent of the time  <-- pinned defect
+...
 PASS  eight rounds do not meet a 10 percent limit, nine do  <-- pinned defect
 ...
-PASS  HTTP 200 with an error body fails, and the 200 is recorded  <-- pinned defect
 PASS  a count with no feature is not a pass  <-- pinned defect
 ...
+PASS  HTTP 200 with an error body fails, and the 200 is recorded  <-- pinned defect
+...
 PASS  a token is never sent over plain http to another host  <-- pinned defect
+...
 PASS  a redirect is a failed probe, is not followed, and its query is dropped  <-- pinned defect
+...
 PASS  a body shorter than its Content-Length fails, so a half-sent image cannot pass  <-- pinned defect
+...
 PASS  a service whose only layer is a group probed nothing, exit 4  <-- pinned defect
 PASS  a clean run with too few rounds is UNDERSAMPLED, not a pass  <-- pinned defect
 ...
 PASS  a prefix of a flag is refused, not read as the flag: --ap  <-- pinned defect
+...
 PASS  a token the server echoes back is removed from the screen and from the report  <-- pinned defect
-PASS  a 251 character token echoed in an error message is removed whole, not cut to a prefix first  <-- pinned defect
-PASS  a map service without Data is probed through export as image bytes, never through a layer query  <-- pinned defect
-PASS  a layer resource passes only when its id is the layer asked for  <-- pinned defect
-PASS  a layer that fails to load on 2 of 8 instances fails a map service whose export still draws  <-- pinned defect
-PASS  with --layer-resources a layer whose resource fails while its query still reads is FAILED  <-- pinned defect
+...
 PASS  and it never probes the tier being restarted or any tier after it  <-- pinned defect
+...
 PASS  a gate does not open on an undersampled pass  <-- pinned defect
 ...
+PASS  a 251 character token echoed in an error message is removed whole, not cut to a prefix first  <-- pinned defect
+...
+PASS  a token written with a slash sent as a JSON escape is removed before the message is cut  <-- pinned defect
+PASS  a token written with every character sent as a unicode escape is removed before the message is cut  <-- pinned defect
+...
+PASS  a map service without Data is probed through export as image bytes, never through a layer query  <-- pinned defect
+...
+PASS  a layer resource passes only when its id is the layer asked for  <-- pinned defect
+...
+PASS  a healthy map service with a raster layer in its root passes, and the raster layer is not queried  <-- pinned defect
+...
+PASS  a layer that fails to load on 2 of 8 instances fails a map service whose export still draws  <-- pinned defect
+...
+PASS  with --layer-resources a layer whose resource fails while its query still reads is FAILED  <-- pinned defect
+...
 PASS  a URL that holds only a user name is refused  <-- pinned defect
+...
 PASS  a FeatureServer is queried layer by layer and never exported  <-- pinned defect
+...
 PASS  a redirect to an address with a password does not print it  <-- pinned defect
 PASS  a token echoed in the Content-Type header is removed before the type is cut  <-- pinned defect
 ...
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-286 assertions, 0 failed
+292 assertions, 0 failed
 ```
 
-The full run prints all 286 assertions. Each `...` line above is where this block is cut.
+The full run prints all 292 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -131,8 +151,8 @@ git clone https://github.com/uhsear/svcsmoke.git
 ```
 
 The self-test starts small HTTP servers on `127.0.0.1` and sends them requests. It needs no
-network and no credentials. It takes about 9 seconds on Windows (Python 3.13) and 3 seconds on
-Linux (Python 3.12), because a few cases wait on a timeout. It prints the same 286
+network and no credentials. It takes about 8 seconds on Windows (Python 3.13) and 3 seconds on
+Linux (Python 3.12), because a few cases wait on a timeout. It prints the same 292
 assertions on Windows (Python 3.13.2), on Python 3.9.25 and on Ubuntu (Python 3.12.3). All three
 outputs are identical line for line, apart from the line endings.
 `coverage run --branch svcsmoke.py --self-test` reports 100 percent of lines and branches.
@@ -171,7 +191,7 @@ python svcsmoke.py --tiers tiers.txt --before app --wait 600
 | `--wait` | `0` | Poll the gate for up to this many seconds. At most 86400. |
 | `--interval` | `10` | Seconds between polls. At most 86400. |
 | `--out` | off | Path for the report CSV. Needs `--apply` to be written. |
-| `--apply` | off | Write `--out`. Without it nothing is written. |
+| `--apply` | off | Write `--out`. Without it the tool writes nothing. `--self-test` is the one exception (see Limits). |
 | `--self-test` | off | Run the assertions and exit. Other flags are ignored. |
 
 The token, when a service needs one, comes from the environment variable `SVCSMOKE_TOKEN`. There
@@ -348,6 +368,15 @@ answers with an invented error body. Another server may list a map service as `M
 restfake does, so the tool switches to `export` only when the root also gives an extent. With no
 extent it queries the layers as for any other map service.
 
+**A layer that is not a feature layer.** Esri's Map Service page shows `type` and `geometryType` on
+every entry of the root `layers` list, with the value `Feature Layer` in its sample ([Map
+Service][mapservice], read on 2026-11-10). The page shows no other value. A root entry whose
+`type` is a string other than `Feature Layer`, such as a raster layer, is not known to answer a
+query. The tool reads its own description (`layer N resource`) in each round and sends it no
+query. An entry with no `type` is queried as before. The rule also applies to ids named with
+`--layers`. A healthy service with a raster layer in its root passes, and the self-test pins that.
+A raster layer that fails to load still fails the service, through its description.
+
 **A layer that did not load.** Esri's pages for the map service and for a layer or table
 describe the layer resource and its `id`, `name`, `type` and `capabilities`. They do not say what a
 layer that failed to load returns, either from its resource or from a query ([Map
@@ -510,12 +539,13 @@ The tool takes these steps so that the token reaches the server and nobody else:
   `http_proxy` to a dead port and checks that the request still arrives.
 - The token value and any `token=` parameter are removed from every line the tool prints and
   from the report. The tool removes them from the whole reply body before it cuts the text to a
-  length, so a token longer than the cut does not survive as a prefix. The self-test has servers
-  that echo a 251 character token back in an error message and in an HTML page, and greps the
-  screen and the report for it. A token that a server echoes in a `Content-Type` header is
+  length, so a token longer than the cut does not survive as a prefix. It scrubs the decoded text of
+  an error message again before the cut, so a token that the body writes with JSON escapes (`\/` or `\uXXXX`) does not survive as a prefix either. The self-test has servers
+  that echo a 251 character token back in an error message and in an HTML page, and in both
+  escaped forms, and greps the screen and the report for it. A token that a server echoes in a `Content-Type` header is
   removed before the type is cut to 40 characters. An unexpected error and a usage error are
   scrubbed the same way.
-- A trailing newline or carriage return on the token, as from a token file, is stripped. A token
+- Whitespace at either end of the token, such as the newline from a token file, is stripped. A token
   with a space, a control character or a non-ASCII character is refused at the start, and the
   message does not quote it.
 
@@ -646,7 +676,8 @@ This tool restarts nothing. It reads and it reports.
 
 ## The report file
 
-Nothing is written without `--apply`. A run with `--out` alone says so:
+The tool writes nothing without `--apply`, apart from the self-test's own temporary directory
+(see Limits). A run with `--out` alone says so:
 
 ```
 $ python svcsmoke.py http://127.0.0.1:8807/arcgis/rest/services/Healthy/MapServer --out r.csv
@@ -890,8 +921,13 @@ $ echo $?
 - **A healthy layer with no features** fails its probe, by design. Leave it out with `--layers`.
 - **Stand-alone tables** in the root `tables` array are never probed. A service that holds only
   tables ends as NOTHING with exit 4.
-- **The root lists no layer type.** A layer that cannot be queried, such as a raster layer, fails
-  its probe until you leave it out with `--layers`. I did not check this against a live server.
+- **Layer types.** Esri's page shows only `Feature Layer` as a root layer `type`. Any other string
+  value is read by description and never queried, and I did not check what a live server lists
+  for a raster layer. A childless group layer (`subLayerIds` empty) is treated as a leaf and
+  queried. Esri does not document that case, and I did not check it.
+- **Layer descriptions are read by default only for map services that cannot be queried.** Without
+  `--layer-resources`, a queried map service or a FeatureServer passes a layer whose own
+  description is an error but whose query still returns a feature.
 - **Map services without Data.** The tool probes such a service through `export` and through
   each layer's description. That shows it draws and that each layer describes itself. It does not
   show that the data reads. `--layers` picks the descriptions that are read and does not change
@@ -909,19 +945,22 @@ $ echo $?
   `Accept-Encoding` header, is read as `NOT_JSON`. A healthy service behind such a proxy shows as
   FAIL.
 - **Token forms.** The tool removes the token in its literal form. It also removes a token
-  that a JSON body echoes with `/` sent as `\/`, because the text is scrubbed again after the
-  body is parsed. A server that echoes the token URL-encoded (`/` as `%2F`) is not scrubbed. The
-  self-test shows both.
+  that a JSON body echoes with `/` sent as `\/`, or with every character sent as `\uXXXX`,
+  because the decoded message is scrubbed before it is cut. A server that echoes the token
+  URL-encoded (`/` as `%2F`), with only some characters percent-encoded, in base64, or with its
+  letters in another case is not scrubbed. The self-test shows the literal and escaped forms.
+  Real Esri error bodies do not echo the token.
 - **Proxies.** A service that is reachable only through a mandatory HTTP proxy fails every probe
   with `TRANSPORT`, because the tool ignores the proxy environment variables on purpose.
 - **Report timing.** The report file is opened only after all sampling ends, so a path that
   cannot be written is reported after the run and not before it.
-- **The self-test writes** tier and report files into a temporary directory and removes it at the
-  end. That is the one write outside `--apply`.
+- **The self-test writes** about ten tier and report files into a temporary directory that it
+  creates and removes at the end. That is the one write outside `--apply`, and it never touches a
+  path that you name.
 - **One connection for every request.** The tool opens a new connection for each request. On
   Windows each closed connection keeps its port in TIME_WAIT for a few minutes. A burst of runs
   can use every ephemeral port, and a request then shows `OSError (errno 10048)` as a false
-  TRANSPORT failure. The self-test sends about 500 requests and makes the same demand. Wait a
+  TRANSPORT failure. The self-test sends more than 600 requests to its stubs and makes the same demand. Wait a
   minute and run again. A self-test that fails for this reason prints FAIL lines and exits 1.
 - **CI.** Read the last line of the self-test (`N assertions, 0 failed`) as well as the exit
   code. A CI step must require the text `0 failed`, because a self-test that printed nothing
@@ -935,12 +974,23 @@ $ echo $?
   self-test never runs, and that is why a CI step must require `0 failed`. The same sweep run on
   Windows, while other loopback jobs ran, gave false kills from port exhaustion (errno 10048).
   Only the Linux result is valid. I did not re-run the sweep on the code that
-  `--layer-resources` added.
+  `--layer-resources`, the layer type rule and the escaped token scrub added, so the figures
+  describe an earlier version of the tool and not the one in this repository.
 - **The estimate in `rounds_needed`.** The logarithm only sets where the search starts. The loop
   that follows decides the answer.
 - **Huge numbers.** A `--rounds` above about 1e308 ends in exit 70 against a target with no
-  plan. So does a root extent with an integer of more than about 308 digits. Both fail closed,
-  and neither is a finding.
+  plan. So does a root extent with an integer of more than about 308 digits. Both end with an
+  `OverflowError` traceback and exit 70. Both fail closed, and neither is a finding. A `--rounds`
+  that large is not a realistic input.
+- **The restfake transcripts** in this README were taken in an earlier session and were not
+  re-run after the layer type rule. The restfake root lists no layer `type`, so the plans they
+  show do not change.
+- **A closed output pipe.** If stdout is closed early, for example by `| head -1`, the tool exits 70
+  with a traceback and not with the verdict or gate code.
+- **Interrupts.** A Ctrl-C during `--wait` is not caught. The process ends with Python's own
+  interrupt status, which is not in the exit code table.
+- **The image signature `BM`.** A body that starts with those two bytes, under an `image/` content
+  type and at or above the byte minimum, passes as a BMP.
 - **Bad host names.** A host name with an empty label, or a label over 63 characters, ends the
   run with exit 64 and an `idna` message. It is not reported as a failed service.
 - **Map services with Data.** A map service that has the Data capability is probed with layer
@@ -956,7 +1006,18 @@ $ echo $?
   no `wkid` or `latestWkid`, ends as NOTHING with exit 4, so a healthy service in a custom
   coordinate system cannot be probed.
 - **No network.** A workstation that has lost its network sends every probe to TRANSPORT and
-  exits 1, the same as a service outage. A gate closes in that case.
+  exits 1, the same as a service outage. A DNS failure, a refused connection and a failed TLS
+  handshake end the same way. A gate closes in each case.
+- **A dead token reads as a dead service.** An expired or missing token makes the server return
+  an `error` property, so the probe fails (SERVER_ERROR) and the run exits 1, as for an outage.
+  Check the `first_failure` text for code 498 or 499 before you treat it as an outage.
+- **A tier name that starts with `=`, `+`, `-` or `@`** is written to the report as typed, so a
+  spreadsheet reads it as a formula.
+- **A port that is not a number.** A URL such as `https://host:text/x/MapServer` is refused with
+  Python's own message, which quotes the port text. Do not type a secret there.
+- **Trust the tiers file.** The tool sends the one token to every `https` host in the file and
+  checks no allow list, so a tiers file from an untrusted source can send the token to a host of
+  its author's choice.
 - **The gate line and the cache.** With `--bust-cache` off, a PASS and an open gate can come
   from a cache. The VERDICT line says so, and the `GATE: OPEN` line does not repeat it.
 - **A group layer** is detected by its `subLayerIds`. The Map Service page does not say how a
