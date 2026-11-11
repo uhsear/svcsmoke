@@ -9,7 +9,8 @@ imagery service fails. The service description answers. The admin page is green.
 check can read says the service is up, because the status says what state the service is in, and
 it does not say whether a request returns anything. Esri's service status operation returns two
 fields, `configuredState` and `realTimeState`. Its example shows them as state names, and
-neither one is the result of a request ([Service status][status]).
+the page does not document either one as the result of a request for a feature or an image
+([Service status][status]).
 
 The first fix is a sweep: ask every layer once, and run the sweep after each restart. It finds
 nothing. Say the fault sits on 2 of the 8 instances in the pool. One request is answered by one
@@ -90,15 +91,19 @@ PASS  a URL that holds only a user name is refused  <-- pinned defect
 ...
 PASS  a FeatureServer is queried layer by layer and never exported  <-- pinned defect
 ...
+PASS  a feature service is never exported, and a map service that lists Map and Data is queried and exported  <-- pinned defect
+PASS  a map service with Data whose export fails on 2 of 8 instances fails  <-- pinned defect
+PASS  a valid blank map export is not a failed probe, because a sparse view draws one  <-- pinned defect
+...
 PASS  a redirect to an address with a password does not print it  <-- pinned defect
 PASS  a token echoed in the Content-Type header is removed before the type is cut  <-- pinned defect
 ...
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-307 assertions, 0 failed
+309 assertions, 0 failed
 ```
 
-The full run prints all 307 assertions. Each `...` line above is where this block is cut.
+The full run prints all 309 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -157,7 +162,7 @@ git clone https://github.com/uhsear/svcsmoke.git
 
 The self-test starts small HTTP servers on `127.0.0.1` and sends them requests. It needs no
 network and no credentials. It takes about 10 seconds on Windows (Python 3.13) and 3 seconds on
-Linux (Python 3.12), because a few cases wait on a timeout. It prints the same 307
+Linux (Python 3.12), because a few cases wait on a timeout. It prints the same 309
 assertions on Windows (Python 3.13.2), on Python 3.9.25 and on Ubuntu (Python 3.12.3). All three
 outputs are identical line for line, apart from the line endings.
 `coverage run --branch svcsmoke.py --self-test` reports 100 percent of lines and branches.
@@ -188,7 +193,7 @@ python svcsmoke.py --tiers tiers.txt --before app --wait 600
 | `--layers` | every layer that is not a group | Comma-separated layer ids to query. Use it to leave out a layer that is meant to be empty. An ImageServer ignores it. On a map service probed through its export it picks the layer resources that are read. An empty value is a usage error. |
 | `--layer-resources` | off | Also read each layer's own description before it is queried, and fail a layer whose description is an error, a page, or names another layer. A map service that cannot be queried always does this. |
 | `--timeout` | `30` | Seconds to wait for one response. At most 86400. |
-| `--min-image-bytes` | `1000` | An image smaller than this counts as blank. A guess; see Limits. |
+| `--min-image-bytes` | `1000` | An ImageServer export smaller than this counts as blank. A map export is not held to it. A guess; see Limits. |
 | `--bust-cache` | off | Add a different throwaway parameter to each round. Without it a PASS says that no cache was ruled out. |
 | `--max-requests` | `2000` | Refuse a plan larger than this, before sending any sample. |
 | `--tiers` | none | A file of tiers in dependency order. Needs `--before`. |
@@ -375,6 +380,27 @@ answers with an invented error body. Another server may list a map service as `M
 restfake does, so the tool switches to `export` only when the root also gives an extent. With no
 extent it queries the layers as for any other map service.
 
+**A map service with Data.** A map service that lists `Map,Query,Data` is queried layer by layer
+and exported in the same two views. A layer query passes on an instance whose export fails, so
+before this the run below read PASS (1 probe, 18 requests). The `Dataexport` stub answers every
+layer query and returns an HTML page for `export` on 2 of 8 instances:
+
+```
+$ python svcsmoke.py http://127.0.0.1:8835/arcgis/rest/services/Dataexport/MapServer
+svcsmoke: 1 target(s), 17 round(s) per probe (the fewest that meet --max-miss)
+sampling: 17 round(s) miss a fault on 1/4 of the instances with probability 0.0075 (limit 0.0100), if each request lands on a random instance
+1. FAIL         http://127.0.0.1:8835/arcgis/rest/services/Dataexport/MapServer  3 probe(s), 52 request(s)
+     view overview: 6 of 17 failed (35.3%): NOT_IMAGE x6. First: content type 'text/html', page titled 'Service Error' (HTTP 200, recorded only)
+     view detail: 5 of 17 failed (29.4%): NOT_IMAGE x5. First: content type 'text/html', page titled 'Service Error' (HTTP 200, recorded only)
+
+VERDICT: FAILED. 1 target(s) returned no feature or image on at least one request. They are not healthy, whatever their state says.
+$ echo $?
+1
+```
+
+A map export gets no byte minimum, because a sparse view of a healthy service is a valid blank
+image. Only the signature and the content type are checked.
+
 **A layer that is not a feature layer.** Esri's Map Service example response shows `type` and
 `geometryType` on a root `layers` entry, with the value `Feature Layer` ([Map
 Service][mapservice], read on 2026-11-10). The page shows no other value. A root entry whose
@@ -457,7 +483,7 @@ service root ([Image Service][imageservice], [Export Image][exportimage]).
 
 The response must pass three tests. Its content type starts with `image/`. Its first bytes are the
 signature of PNG, JPEG, GIF, BMP or TIFF ([PNG signature][png], [other
-signatures][signatures]). It is at least `--min-image-bytes` long. An HTML page that arrives with
+signatures][signatures]). It is at least `--min-image-bytes` long. (A map service export gets the first two tests only: a sparse view draws a valid blank image, so a small one is not a fault.) An HTML page that arrives with
 HTTP 200 fails and is named:
 
 ```
@@ -547,7 +573,7 @@ The tool takes these steps so that the token reaches the server and nobody else:
 - No proxy is used. The tool passes `urllib` an empty proxy table, which the Python documentation
   gives as the way to disable a detected proxy ([urllib.request][urllib]). The self-test sets
   `http_proxy` to a dead port and checks that the request still arrives.
-- The token value and any `token=` parameter are removed from every line the tool prints and
+- The token value, in its literal and JSON-escaped forms, and any `token=` parameter are removed from every line the tool prints and
   from the report. The tool removes them from the whole reply body before it cuts the text to a
   length, so a token longer than the cut does not survive as a prefix. It scrubs the decoded text of
   an error message again before the cut, so a token that the body writes with JSON escapes (`\/` or `\uXXXX`) does not survive as a prefix either. The self-test has servers
@@ -797,6 +823,8 @@ Run it as `python stub.py 8803 33`, where the second number seeds which requests
 instance. The `Pool` service has 2 of 8 instances failing layer 1. `Imagery` has 2 of 8 returning
 an HTML page for `exportImage`. `Draw` is a map service published with the `Map` capability
 only. `Drawfault` is the same with a second layer that fails to load on 2 of 8 instances.
+`Dataexport` lists `Map,Query,Data`, answers every layer query, and returns an HTML page for
+`export` on 2 of 8 instances.
 
 Each output in this README came from a stub started for that example. Examples that ran one after
 another against the same port shared a stub, and ran in the order they appear. The gate examples
@@ -833,6 +861,8 @@ def script(path, params, headers):
     if path.endswith("/ImageServer"):
         return {"body": json.dumps({"extent": EXTENT}).encode()}
     if path.endswith("/export"):        # Export Map, on the Draw service
+        if name == "Dataexport" and instance < 2:
+            return {"body": PAGE, "ctype": "text/html"}
         return {"body": PNG, "ctype": "image/png"}
     if path.endswith("exportImage"):
         if name == "Imagery" and instance < 2:
@@ -851,6 +881,10 @@ def script(path, params, headers):
                                         "fullExtent": EXTENT,
                                         "layers": LAYERS[:1] if name == "Draw"
                                         else LAYERS}).encode()}
+        if name == "Dataexport":            # Map, Query and Data
+            return {"body": json.dumps({"capabilities": "Map,Query,Data",
+                                        "fullExtent": EXTENT,
+                                        "layers": LAYERS[:1]}).encode()}
         if name == "Empty":
             return {"body": json.dumps({"layers": [
                 {"id": 0, "name": "group", "subLayerIds": [1]}]}).encode()}
@@ -909,16 +943,18 @@ $ echo $?
   passes that service, and a client that calls `returnCountOnly` still fails on it. The evidence
   follows the list.
 
-- **Blank images.** The 1000 byte minimum is a guess that stands for "a blank export is small".
-  A real raster with no data at the centre of the extent can draw a blank detail view and fail.
-  A transparent blank 400 by 400 PNG built with zlib is about 700 bytes, so an empty detail view
-  of a healthy service fails under the default. Measure an export of your own imagery, and lower
-  `--min-image-bytes` if a real tile is smaller. The tool does not decode an image. A blank PNG
-  of at least the minimum passes. So does an image with a valid header and truncated pixel data,
-  when the server sends no `Content-Length` to compare with. A solid-colour 400 by 400 JPEG is
-  about 3 KB, and a solid opaque white PNG of that size is about 1.4 KB (measured with Pillow
-  12.3.0), so a blank opaque export passes the byte minimum. Only a transparent blank PNG, about
-  700 bytes, falls under it.
+- **Blank images.** The 1000 byte minimum applies to an ImageServer export only, and it is a guess
+  that stands for "a blank export is small". A real raster with no data at the centre of the extent
+  can draw a blank detail view and fail. A transparent blank 400 by 400 PNG built with zlib is
+  about 700 bytes, so an empty detail view of a healthy image service fails under the default.
+  Measure an export of your own imagery, and lower `--min-image-bytes` if a real tile is smaller.
+  A map export has no minimum, because a sparse view of a healthy map service draws exactly such
+  an image, so a map service that draws blank passes its export probes. The tool does not decode
+  an image. A blank PNG of at least the minimum passes. So does an image with a valid header and
+  truncated pixel data, when the server sends no `Content-Length` to compare with. A solid-colour
+  400 by 400 JPEG is about 3 KB, and a solid opaque white PNG of that size is about 1.4 KB
+  (measured with Pillow 12.3.0), so a blank opaque export passes the byte minimum. Only a
+  transparent blank PNG, about 700 bytes, falls under it.
 - **Timeouts.** `--timeout` goes to the socket, so it is a limit on each blocking operation and
   not on the whole response ([urllib.request][urllib]). A server that sends one byte every few
   seconds can outlast it.
@@ -943,8 +979,7 @@ $ echo $?
   `type` key it is queried. Esri does not document that case, and I did not check it.
 - **Layer descriptions are read by default only for map services that cannot be queried.** Without
   `--layer-resources`, a queried map service or a FeatureServer passes a layer whose own
-  description is an error but whose query still returns a feature. Without `--layer-resources` a
-  layer whose own description is invalid is not failed if its query returns a feature.
+  description is an error but whose query still returns a feature.
 - **Map services without Data.** The tool probes such a service through `export` and through
   each layer's description. That shows it draws and that each layer describes itself. It does not
   show that the data reads. `--layers` picks the descriptions that are read and does not change
@@ -990,25 +1025,28 @@ $ echo $?
   self-test from running, so a CI step must require the text `0 failed`.
 - **The estimate in `rounds_needed`.** The logarithm only sets where the search starts. The loop
   that follows decides the answer.
-- **Huge numbers.** A `--rounds` above about 1e308 ends in exit 70 against a target with no
-  plan. So does a root extent with an integer of more than about 308 digits. Both end with an
-  `OverflowError` traceback and exit 70. Both fail closed, and neither is a finding. A `--rounds`
-  that large is not a realistic input.
+- **Huge numbers.** A `--rounds` of more than 308 digits ends in exit 70 against a service with
+  no plan (the text `1e308` is a usage error, exit 64). So does a root extent corner with an
+  integer of more than about 308 digits. Both end with an `OverflowError` traceback and exit 70.
+  Both fail closed, and neither is a finding. Neither is a realistic input.
 - **The restfake transcripts** in this README were re-run after the layer type rule, and every
   line matched. The restfake root lists no layer `type`, so the plans they show did not change.
-- **A closed output pipe.** If stdout is closed early, for example by `| head -1`, the tool exits 70
-  with a traceback and not with the verdict or gate code.
+- **A closed output pipe.** If stdout is closed early, for example by `| head -1`, Python fails
+  to flush stdout at exit and the process ends with exit 120 and an "Exception ignored" line on
+  stderr, with no traceback. I measured 120 on Windows with Python 3.13 and on Linux with Python
+  3.12. The verdict or gate code is lost, but 120 is not zero, so `svcsmoke ... && restart-app`
+  still stops. Read the whole output when the exit code gates a restart.
 - **Interrupts.** A Ctrl-C during `--wait` is not caught. The process ends with Python's own
   interrupt status, which is not in the exit code table.
 - **The image signature `BM`.** A body that starts with those two bytes, under an `image/` content
   type and at or above the byte minimum, passes as a BMP.
 - **Bad host names.** A host name with an empty label, or a label over 63 characters, ends the
   run with exit 64 and an `idna` message. It is not reported as a failed service.
-- **Map services with Data.** A map service that has the Data capability is probed with layer
-  queries only. Its export is never requested, so a map service that draws badly while its
-  queries work reads PASS. The exception is a service whose root layers all name a type other than
-  Feature Layer, such as a raster-only map service: it is exported too, because a layer
-  description alone would pass it. Without an extent to draw it ends as NOTHING with exit 4.
+- **Map services with Data.** A map service that lists `Map` and `Data` is queried layer by layer
+  and exported in the same two views, so an export that fails on bad instances fails the run.
+  A `capabilities` string that has `Data` and not `Map` is only queried. A root with no
+  `capabilities` string is only queried, because nothing says export works. A root with no extent
+  is only queried. Which strings a live server lists, I did not check.
 - **Redirects to https.** A server that redirects `http` to `https` makes a healthy service FAIL
   with `REDIRECT`. Give the `https` URL.
 - **One token for every tier.** The same token goes to every URL in a `--tiers` file, including
@@ -1024,6 +1062,10 @@ $ echo $?
 - **A dead token reads as a dead service.** An expired or missing token makes the server return
   an `error` property, so the probe fails (SERVER_ERROR) and the run exits 1, as for an outage.
   Check the `first_failure` text for code 498 or 499 before you treat it as an outage.
+- **An HTTP 304** is read as any 3xx and shows as `REDIRECT` with an empty place name
+  (`redirected to `). The verdict is still FAIL.
+- **Loopback addresses other than `localhost`, `127.0.0.1` and `::1`**, such as `127.0.0.2`, are
+  refused for a plain `http` URL when a token is set. That fails closed.
 - **A tier name that starts with `=`, `+`, `-`, `@`, tab or CR** is written to the report as
   typed, so a spreadsheet reads it as a formula. Name tiers with letters.
 - **A tier name is printed and written as typed.** The tool does not scrub it, so do not use the
@@ -1037,6 +1079,8 @@ $ echo $?
   differently on your screen.
 - **A port that is not a number.** A URL such as `https://host:text/x/MapServer` is refused with
   Python's own message, which quotes the port text. Do not type a secret there.
+- **A bad tier line is quoted.** The refusal for a tier URL that is not a URL quotes up to 60
+  characters of that line, so do not point `--tiers` at a file that holds secrets.
 - **Trust the tiers file.** The tool sends the one token to every `https` host in the file and
   checks no allow list, so a tiers file from an untrusted source can send the token to a host of
   its author's choice.

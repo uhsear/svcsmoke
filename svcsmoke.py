@@ -9,7 +9,7 @@ rounds are too few to support the claim, and counts a probe as passed only when
 the body holds a feature or the bytes of an image. The HTTP status is recorded
 and never decides. A map service whose capabilities leave out Data cannot be
 queried, so its export is probed for image bytes and each layer is asked to
-describe itself. A layer that fails to load fails the service, whichever probe
+describe itself. A map service that lists Map and Data is queried and exported. A layer that fails to load fails the service, whichever probe
 finds it.
 
     python svcsmoke.py --self-test
@@ -82,9 +82,10 @@ DEFAULT_MAX_MISS = 0.01
 # Seconds to wait for one response before the probe counts as failed.
 DEFAULT_TIMEOUT = 30.0
 
-# An exported image smaller than this is treated as blank. This is a heuristic
-# and a guess, not a rule: measure an export of your own imagery before
-# trusting it, and lower it with --min-image-bytes if a real tile is smaller.
+# An image service export smaller than this is treated as blank. This is a
+# heuristic and a guess, not a rule: measure an export of your own imagery
+# before trusting it, and lower it with --min-image-bytes if a real tile is
+# smaller. A map export is not held to it: a sparse view draws a valid blank.
 DEFAULT_MIN_IMAGE_BYTES = 1000
 
 # One exportImage request is square and this many pixels on a side. 400 is the
@@ -516,6 +517,19 @@ def can_query(doc):
     return "data" in [c.strip().lower() for c in capabilities.split(",")]
 
 
+def can_export(doc):
+    """True for a map service whose capabilities string lists Map.
+
+    Esri names Map as the capability Export Map requires. A service that
+    lists Data and Map is queried and exported. With no capabilities string
+    nothing says export works, so the layers alone are probed.
+    """
+    capabilities = doc.get("capabilities")
+    if not isinstance(capabilities, str):
+        return False
+    return "map" in [c.strip().lower() for c in capabilities.split(",")]
+
+
 def resource_probes(ids):
     return [Probe("layer %d resource" % i, layer=i, resource=True)
             for i in ids]
@@ -544,7 +558,8 @@ def build_plan(service_kind, doc, wanted, resources=False):
     A layer resource probe asks for the layer's own description. A map
     service that cannot be queried gets one for each layer next to its two
     export views, because an export alone cannot see a layer that failed to
-    load. With `resources`, every other layer is read before it is queried.
+    load. With `resources`, every other layer is read before it is queried. A
+    map service that lists Map and Data is queried and exported.
     """
     if service_kind == IMAGE_SERVER:
         return views_from_root(doc)
@@ -570,6 +585,10 @@ def build_plan(service_kind, doc, wanted, resources=False):
         return [], ("no layer is known to return a feature and the service "
                     "root has no extent to export, so a layer description "
                     "alone would pass it")
+    # A queried map service that can also draw is exported too, because a
+    # layer query passes on an instance whose export fails.
+    if service_kind == MAP_SERVER and can_export(doc):
+        probes += views_from_root(doc, "export")[0]
     return probes, ""
 
 
@@ -894,7 +913,10 @@ def sample_target(result, rounds, fetch, bust, min_bytes, token, stop_on_fail):
             result.requests += 1
             # A view is judged on image bytes, whatever the service kind.
             kind = IMAGE_SERVER if probe.layer is None else result.target.kind
-            stat.add(judge(kind, reply, min_bytes, token,
+            # A map export of a sparse view is a valid blank image, so only an
+            # image service is held to the byte minimum.
+            floor = min_bytes if result.target.kind == IMAGE_SERVER else 0
+            stat.add(judge(kind, reply, floor, token,
                            probe.layer if probe.resource else None))
         if stop_on_fail and any(s.failed for s in result.stats):
             break
@@ -2461,7 +2483,7 @@ def _assertions(tmp, passed, failed, stubs):
           and classify_image("image/png", blank, DEFAULT_MIN_IMAGE_BYTES)[0]
           == SMALL_IMAGE,
           "a transparent blank 400 by 400 PNG is under the default minimum, "
-          "so an empty detail view fails")
+          "so an empty image service view fails")
 
     # ---- audit round 2: each case below was a reproduced defect
     for what, bad_url in (
@@ -2497,9 +2519,52 @@ def _assertions(tmp, passed, failed, stubs):
     check([p.name for p in build_plan(FEATURE_SERVER, dict(
         FULL, capabilities="Query"), [])[0]] == ["layer 4"]
           and [p.name for p in build_plan(MAP_SERVER, dict(
-              FULL, capabilities="Map,Query,Data"), [])[0]] == ["layer 4"],
-          "only a map service without Data is exported, never a feature "
-          "service or a map service with Data  <-- pinned defect")
+              FULL, capabilities="Query,Data"), [])[0]] == ["layer 4"]
+          and [p.name for p in build_plan(MAP_SERVER, FULL, [])[0]]
+          == ["layer 4"]
+          and [p.name for p in build_plan(MAP_SERVER, dict(
+              FULL, capabilities="Map,Query,Data"), [])[0]]
+          == ["layer 4", "view overview", "view detail"]
+          and [p.name for p in build_plan(MAP_SERVER, dict(
+              {"layers": FULL["layers"]}, capabilities="Map,Data"), [])[0]]
+          == ["layer 4"],
+          "a feature service is never exported, and a map service that lists "
+          "Map and Data is queried and exported  <-- pinned defect")
+
+    # A map service that lists Map and Data is queried, and its export was
+    # never asked. An export that fails on 2 of 8 instances passed with exit 0.
+    data_root = json.dumps({
+        "capabilities": "Map,Query,Data", "fullExtent": EXTENT,
+        "layers": [{"id": 0, "subLayerIds": None}]}).encode()
+
+    def data_pool(m, bad, rng, image=PNG):
+        def script(path, params, headers):
+            if path.endswith("/MapServer"):
+                return {"body": data_root}
+            if path.endswith("/query"):
+                return {"body": GOOD}
+            if int(rng.random() * m) < bad:
+                return {"body": ERR}
+            return {"body": image, "ctype": "image/png"}
+        return script
+    stub = serve(data_pool(8, 2, random.Random(5)))
+    res = survey([target(stub, "/dx/MapServer")], opts(rounds=17, needed=17),
+                 make_fetcher(None, 5))[0]
+    by_name = dict((s.name, s) for s in res.stats)
+    check(res.verdict == FAIL and exit_code([res]) == 1
+          and by_name["layer 0"].failed == 0
+          and by_name["view overview"].failed > 0
+          and by_name["view overview"].kinds == {NOT_IMAGE: by_name[
+              "view overview"].failed}
+          and res.requests == 1 + 17 * 3,
+          "a map service with Data whose export fails on 2 of 8 instances "
+          "fails  <-- pinned defect")
+    stub = serve(data_pool(1, 0, random.Random(5), image=blank))
+    res = survey([target(stub, "/db/MapServer")], opts(rounds=2),
+                 make_fetcher(None, 5))[0]
+    check(res.verdict == PASS and res.requests == 7,
+          "a valid blank map export is not a failed probe, because a sparse "
+          "view draws one  <-- pinned defect")
 
     # Every extent above is centred on 0. A real Web Mercator extent is not.
     views, why = views_from_root({"extent": {
@@ -2846,7 +2911,7 @@ def _parse(argv):
                          % DEFAULT_TIMEOUT)
     ap.add_argument("--min-image-bytes", dest="min_image_bytes", type=int,
                     default=DEFAULT_MIN_IMAGE_BYTES,
-                    help="an image smaller than this counts as blank "
+                    help="an image service export smaller than this counts as blank "
                          "(default %d)" % DEFAULT_MIN_IMAGE_BYTES)
     ap.add_argument("--bust-cache", dest="bust_cache", action="store_true",
                     help="add a different throwaway parameter to each round, "
