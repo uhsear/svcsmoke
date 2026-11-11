@@ -409,7 +409,7 @@ def check_target(url, token):
     if parts.username or parts.password:
         raise ValueError("a URL may not carry a user name or password; put "
                          "the token in %s" % TOKEN_ENV)
-    if parts.query or parts.fragment:
+    if parts.query or parts.fragment or "?" in url or "#" in url:
         raise ValueError("a URL may not carry a query string or fragment, so "
                          "a token cannot ride in one. Put it in %s"
                          % TOKEN_ENV)
@@ -2215,6 +2215,14 @@ def _assertions(tmp, passed, failed, stubs):
     check(res.verdict == FAIL and "layer 1 resource" in [
         s_.name for s_ in res.stats if s_.failed],
           "a raster layer whose resource is an error still fails the service")
+    group_doc = {"capabilities": "Map,Query,Data", "layers": [
+        {"id": 0, "subLayerIds": None, "type": "Feature Layer"},
+        {"id": 1, "subLayerIds": [], "type": "Group Layer"}]}
+    check([(p.name, p.resource) for p in build_plan(MAP_SERVER, group_doc,
+                                                    [])[0]]
+          == [("layer 0", False), ("layer 1 resource", True)],
+          "a childless entry typed Group Layer is described and never "
+          "queried  <-- pinned defect")
 
     # A map service whose only layers are not feature layers returns no feature
     # to query, so a layer description alone must not pass it.
@@ -2630,6 +2638,10 @@ def _assertions(tmp, passed, failed, stubs):
            "DEL is refused in a URL")
     raises(lambda: check_target("http://h.example/ /MapServer", None),
            "a space is refused in a URL")
+    raises(lambda: check_target("http://h.example/x/MapServer?", None),
+           "a bare question mark is refused in a URL  <-- pinned defect")
+    raises(lambda: check_target("http://h.example/x/MapServer#", None),
+           "a bare fragment mark is refused in a URL  <-- pinned defect")
     code, out, err = run([ok_stub.url("/svc/MapServer")], token="!tok~")
     check(code == 0 and ok_stub.requests[-1:] != []
           and ok_stub.requests[-1][2].get("X-Esri-Authorization")

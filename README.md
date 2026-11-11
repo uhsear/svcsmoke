@@ -95,10 +95,10 @@ PASS  a token echoed in the Content-Type header is removed before the type is cu
 ...
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-304 assertions, 0 failed
+307 assertions, 0 failed
 ```
 
-The full run prints all 304 assertions. Each `...` line above is where this block is cut.
+The full run prints all 307 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -156,8 +156,8 @@ git clone https://github.com/uhsear/svcsmoke.git
 ```
 
 The self-test starts small HTTP servers on `127.0.0.1` and sends them requests. It needs no
-network and no credentials. It takes about 8 seconds on Windows (Python 3.13) and 3 seconds on
-Linux (Python 3.12), because a few cases wait on a timeout. It prints the same 304
+network and no credentials. It takes about 10 seconds on Windows (Python 3.13) and 3 seconds on
+Linux (Python 3.12), because a few cases wait on a timeout. It prints the same 307
 assertions on Windows (Python 3.13.2), on Python 3.9.25 and on Ubuntu (Python 3.12.3). All three
 outputs are identical line for line, apart from the line endings.
 `coverage run --branch svcsmoke.py --self-test` reports 100 percent of lines and branches.
@@ -382,7 +382,10 @@ Service][mapservice], read on 2026-11-10). The page shows no other value. A root
 query. The tool reads its own description (`layer N resource`) in each round and sends it no
 query. An entry with no `type` is queried as before. The rule also applies to ids named with
 `--layers`. A healthy service with a raster layer in its root passes, and the self-test pins that.
-A raster layer that fails to load still fails the service, through its description.
+The stub fails the service when a raster layer's description is an error. I did not check
+that a live server answers that way for a raster layer that failed to load. If it answers with a
+valid description, nothing draws or reads that layer, and a service with a broken raster layer
+passes.
 
 **A layer that did not load.** Esri's pages for the map service and for a layer or table
 describe the layer resource and its `id`, `name`, `type` and `capabilities`. They do not say what a
@@ -935,8 +938,9 @@ $ echo $?
   tables ends as NOTHING with exit 4. A table that fails to load is not seen.
 - **Layer types.** Esri's page shows only `Feature Layer` as a root layer `type`. Any other string
   value is read by description and never queried, and I did not check what a live server lists
-  for a raster layer. A childless group layer (`subLayerIds` empty) is treated as a leaf and
-  queried. Esri does not document that case, and I did not check it.
+  for a raster layer. A childless entry (`subLayerIds` empty) is treated as a leaf. If its `type`
+  is `Group Layer` it is read by description and never queried, like any other type. With no
+  `type` key it is queried. Esri does not document that case, and I did not check it.
 - **Layer descriptions are read by default only for map services that cannot be queried.** Without
   `--layer-resources`, a queried map service or a FeatureServer passes a layer whose own
   description is an error but whose query still returns a feature. Without `--layer-resources` a
@@ -963,7 +967,8 @@ $ echo $?
   because the decoded message is scrubbed before it is cut. A server that echoes the token
   URL-encoded (`/` as `%2F`), with only some characters percent-encoded, in base64, or with its
   letters in another case is not scrubbed. The self-test shows the literal and escaped forms.
-  Real Esri error bodies do not echo the token.
+  I did not see a real Esri error body echo the token, but I had no live server to check. A token
+  with a double quote or backslash that a non-JSON body echoes is not removed either.
 - **Proxies.** A service that is reachable only through a mandatory HTTP proxy fails every probe
   with `TRANSPORT`, because the tool ignores the proxy environment variables on purpose.
 - **Report timing.** The report file is opened only after all sampling ends, so a path that
@@ -979,17 +984,10 @@ $ echo $?
 - **CI.** Read the last line of the self-test (`N assertions, 0 failed`) as well as the exit
   code. A CI step must require the text `0 failed`, because a self-test that printed nothing
   would also exit 0. A red self-test exits 1, the same code as a failed service.
-- **Mutation sweep.** I ran 760 mutants of the non-test code of the version before `--layer-resources`, on Linux with Python
-  3.12.3. The sweep is a scratch script and is not shipped. It flips comparisons, boolean
-  operators, constants, branches and return values. The self-test killed 735 and 25 survived.
-  Eleven survivors change only how long a quoted text is cut. Two change a read cap and a split
-  limit with no visible effect. Four are equivalent mutants. Three sit in the starting guess of
-  `rounds_needed`. Five replace the return value of `main()` or the `__name__` guard, so the
-  self-test never runs, and that is why a CI step must require `0 failed`. The same sweep run on
-  Windows, while other loopback jobs ran, gave false kills from port exhaustion (errno 10048).
-  Only the Linux result is valid. I did not re-run the sweep on the code that
-  `--layer-resources`, the layer type rule and the escaped token scrub added, so the figures
-  describe an earlier version of the tool and not the one in this repository. The mutation figures are not reproducible from this repository.
+- **No mutation sweep ships.** An earlier version was swept with a scratch script that is not in
+  this repository, and I do not quote its figures because nobody can re-run them here. A
+  mutation that replaces the return value of `main()` or the `__name__` guard stops the
+  self-test from running, so a CI step must require the text `0 failed`.
 - **The estimate in `rounds_needed`.** The logarithm only sets where the search starts. The loop
   that follows decides the answer.
 - **Huge numbers.** A `--rounds` above about 1e308 ends in exit 70 against a target with no
@@ -1028,6 +1026,13 @@ $ echo $?
   Check the `first_failure` text for code 498 or 499 before you treat it as an outage.
 - **A tier name that starts with `=`, `+`, `-`, `@`, tab or CR** is written to the report as
   typed, so a spreadsheet reads it as a formula. Name tiers with letters.
+- **A tier name is printed and written as typed.** The tool does not scrub it, so do not use the
+  token as a tier name. Every text that comes from a server is scrubbed.
+- **Exit 1 does not tell a failed service from a probe the tool could not make.** A refused
+  connection, a DNS failure, a TLS failure and a dead token all exit 1, as a real fault does.
+- **The plain-http token check trusts the name `localhost`,** not the address it resolves to.
+- **A layer that fails to load only on a stand-alone table** is never seen, because tables are
+  not probed. "Each layer" in this tool means each layer in the root `layers` array.
 - **Usage text** wraps to the width of the terminal, so the `--ap` block above can wrap
   differently on your screen.
 - **A port that is not a number.** A URL such as `https://host:text/x/MapServer` is refused with
