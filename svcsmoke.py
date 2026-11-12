@@ -942,14 +942,30 @@ def new_run_id():
     return "%x%04x" % (int(time.time() * 1000), random.getrandbits(16))
 
 
+def root_url_for(base, bust, run, label):
+    """The service root request. `label` makes it new when bust is on."""
+    url = base + "?f=json"
+    if bust:
+        url += "&_svcsmoke=" + make_nonce(run, label)
+    return url
+
+
 def sample_target(result, rounds, fetch, bust, min_bytes, token, stop_on_fail,
                   run=""):
-    """Ask every probe once per round. With stop_on_fail, end the round a
-    failure appears in, because a gate that is already closed gains nothing
-    from hammering a tier that is coming back up."""
+    """Ask every probe once per round. The service root is asked again at the
+    start of every round after the first, because a pool instance can serve a
+    bad root and good layers. With stop_on_fail, end the round a failure
+    appears in, because a gate that is already closed gains nothing from
+    hammering a tier that is coming back up."""
     base = result.target.url
     result.stats = [ProbeStat(p.name) for p in result.plan]
     for number in range(rounds):
+        if number:
+            reply = fetch(root_url_for(base, bust, run, "root%d" % number))
+            result.requests += 1
+            failure = judge_root(reply, token)[1]
+            if failure and result.root is None:
+                result.root = failure
         for probe, stat in zip(result.plan, result.stats):
             reply = fetch(probe_url(base, probe,
                                   make_nonce(run, number) if bust else None))
@@ -961,7 +977,7 @@ def sample_target(result, rounds, fetch, bust, min_bytes, token, stop_on_fail,
             floor = min_bytes if result.target.kind == IMAGE_SERVER else 0
             stat.add(judge(kind, reply, floor, token,
                            probe.layer if probe.resource else None))
-        if stop_on_fail and any(s.failed for s in result.stats):
+        if stop_on_fail and (result.root or any(s.failed for s in result.stats)):
             break
 
 
@@ -974,10 +990,7 @@ def survey(targets, options, fetch, stop_on_fail=False):
     run = options.get("run", "")
     for target in targets:
         result = TargetResult(target)
-        root_url = target.url + "?f=json"
-        if options["bust"]:
-            root_url += "&_svcsmoke=" + make_nonce(run, "root")
-        reply = fetch(root_url)
+        reply = fetch(root_url_for(target.url, options["bust"], run, "root"))
         result.requests += 1
         doc, failure = judge_root(reply, options["token"])
         if failure:
@@ -988,7 +1001,8 @@ def survey(targets, options, fetch, stop_on_fail=False):
                 options.get("resources", False))
         results.append(result)
     planned = sum(len(r.plan) * options["rounds"] for r in results)
-    sent = sum(r.requests for r in results)
+    sent = sum(r.requests + (options["rounds"] - 1 if r.plan else 0)
+               for r in results)
     if planned + sent > options["max_requests"]:
         raise ValueError(
             "the plan is %d request(s) (%d probe(s) over %d round(s), plus "
@@ -1594,12 +1608,13 @@ def _assertions(tmp, passed, failed, stubs):
     res = survey([target(stub, "/svc/MapServer")], opts(rounds=3), make_fetcher(
         None, 5))[0]
     queried = [r[0] for r in stub.requests]
-    check(res.verdict == PASS and res.requests == 7
+    check(res.verdict == PASS and res.requests == 9
           and sorted(set(queried)) == ["/svc/MapServer", "/svc/MapServer/0/"
                                        "query", "/svc/MapServer/2/query"]
+          and queried.count("/svc/MapServer") == 3
           and queried.count("/svc/MapServer/0/query") == 3,
-          "a healthy service passes: one root, then each leaf layer per round"
-          ", and the group layer is never queried")
+          "a healthy service passes: the root and each leaf layer every "
+          "round, and the group layer is never queried")
     check(all("token" not in p and not any("T0K3N" in v for v in p.values())
               for _, p, _ in stub.requests), "no request carried a token")
     secret = "T0K3N-abc123"
@@ -1698,7 +1713,7 @@ def _assertions(tmp, passed, failed, stubs):
     res = survey([target(stub, "/img/ImageServer", IMAGE_SERVER)],
                  opts(rounds=2), make_fetcher(None, 5))[0]
     shots = [r[1] for r in stub.requests if r[0].endswith("exportImage")]
-    check(res.verdict == PASS and res.requests == 5
+    check(res.verdict == PASS and res.requests == 6
           and [s["bbox"] for s in shots[:2]] == [
               "-1000.000000,-1000.000000,1000.000000,1000.000000",
               "-10.000000,-10.000000,10.000000,10.000000"]
@@ -1737,7 +1752,8 @@ def _assertions(tmp, passed, failed, stubs):
                                                   run="r2"),
            make_fetcher(None, 5))
     seen = [r[1].get("_svcsmoke") for r in stub.requests]
-    check(seen == ["r1-root", "r1-0", "r1-1", "r2-root", "r2-0", "r2-1"],
+    check(seen == ["r1-root", "r1-0", "r1-root1", "r1-1", "r2-root",
+                    "r2-0", "r2-root1", "r2-1"],
           "the nonce names the run and the service root is busted too, so a "
           "cache that kept an earlier run cannot answer  <-- pinned defect")
     check(make_nonce("", 3) == "3" and make_nonce("ab", "root") == "ab-root"
@@ -1778,7 +1794,7 @@ def _assertions(tmp, passed, failed, stubs):
                  make_fetcher(None, 5), stop_on_fail=True)[0]
     full = survey([target(stub, "/svc/MapServer")], opts(rounds=5),
                   make_fetcher(None, 5))[0]
-    check(res.requests == 2 and full.requests == 6,
+    check(res.requests == 2 and full.requests == 10,
           "a gate stops at the round a failure shows in, a plain run does not")
     stub = serve(pool(1, 0, random.Random(1)))
     raises(lambda: survey([target(stub, "/svc/MapServer")],
@@ -1825,7 +1841,7 @@ def _assertions(tmp, passed, failed, stubs):
     code, out, err = run([stub.url("/svc/MapServer")])
     check(code == 0 and "VERDICT: PASS" in out
           and "17 round(s) per probe (the fewest that meet --max-miss)" in out
-          and len(stub.requests) == 18 and err == "",
+          and len(stub.requests) == 34 and err == "",
           "a healthy service passes at the 17 rounds the miss limit demands")
     code, out, err = run([stub.url("/svc/MapServer"), "--rounds", "8"])
     check(code == 3 and "VERDICT: UNDERSAMPLED" in out
@@ -2275,7 +2291,7 @@ def _assertions(tmp, passed, failed, stubs):
     res = survey([target(stub, "/draw/MapServer")], opts(rounds=2),
                  make_fetcher(None, 5))[0]
     asked = [r for r in stub.requests if r[0].endswith("/export")]
-    check(res.verdict == PASS and res.requests == 7 and len(asked) == 4
+    check(res.verdict == PASS and res.requests == 8 and len(asked) == 4
           and not any(r[0].endswith("query") for r in stub.requests)
           and all(r[1]["format"] == "png" and r[1]["f"] == "image"
                   and r[1]["size"] == "400,400" for r in asked),
@@ -2355,7 +2371,7 @@ def _assertions(tmp, passed, failed, stubs):
     stub = serve(raster_script(True))
     res = survey([target(stub, "/ras/MapServer")], opts(rounds=2),
                  make_fetcher(None, 5))[0]
-    check(res.verdict == PASS and res.requests == 5
+    check(res.verdict == PASS and res.requests == 6
           and not any(r[0].endswith("/1/query") for r in stub.requests),
           "a healthy map service with a raster layer in its root passes, and "
           "the raster layer is not queried  <-- pinned defect")
@@ -2455,7 +2471,7 @@ def _assertions(tmp, passed, failed, stubs):
           and by_name["layer 0 resource"].failed == 0
           and by_name["view overview"].failed == 0
           and by_name["view detail"].failed == 0
-          and res.requests == 1 + 17 * 5,
+          and res.requests == 17 + 17 * 5,
           "a layer that fails to load on 2 of 8 instances fails a map service "
           "whose export still draws  <-- pinned defect")
     lines = describe([res], {"rounds": 17, "needed": 17, "fraction": 0.25,
@@ -2493,7 +2509,7 @@ def _assertions(tmp, passed, failed, stubs):
     res = survey([target(stub, "/bl/MapServer")], opts(rounds=2),
                  make_fetcher(None, 5))[0]
     plain = [r[0] for r in stub.requests]
-    check(res.verdict == PASS and res.requests == 5
+    check(res.verdict == PASS and res.requests == 6
           and not any(p.endswith("/MapServer/0") or p.endswith("/MapServer/1")
                       for p in plain),
           "without --layer-resources a queried map service reads no layer "
@@ -2501,7 +2517,7 @@ def _assertions(tmp, passed, failed, stubs):
     stub = serve(broken_layer)
     res = survey([target(stub, "/bl/MapServer")],
                  opts(rounds=2, resources=True), make_fetcher(None, 5))[0]
-    check(res.verdict == FAIL and res.requests == 9
+    check(res.verdict == FAIL and res.requests == 10
           and [s.failed for s in res.stats] == [0, 0, 2, 0]
           and stat(res, 2).name == "layer 1 resource",
           "with --layer-resources a layer whose resource fails while its "
@@ -2633,10 +2649,10 @@ def _assertions(tmp, passed, failed, stubs):
     feature_stub = serve(feature_root)
     res = survey([target(feature_stub, "/f/FeatureServer", FEATURE_SERVER)],
                  opts(rounds=2), make_fetcher(None, 5))[0]
-    check(res.verdict == PASS and res.requests == 3
+    check(res.verdict == PASS and res.requests == 4
           and [r[0] for r in feature_stub.requests]
           == ["/f/FeatureServer", "/f/FeatureServer/0/query",
-              "/f/FeatureServer/0/query"],
+              "/f/FeatureServer", "/f/FeatureServer/0/query"],
           "a FeatureServer is queried layer by layer and never exported  "
           "<-- pinned defect")
     code, out, err = run([feature_stub.url("/f/FeatureServer")])
@@ -2658,6 +2674,41 @@ def _assertions(tmp, passed, failed, stubs):
           == ["layer 4"],
           "a feature service is never exported, and a map service that lists "
           "Map and Data is queried and exported  <-- pinned defect")
+
+    # The service root is read every round, because a pool instance can serve
+    # a bad root and good layers. A root read once let such an instance pass.
+    def root_pool(m, bad, rng, nth=None):
+        seen = {"roots": 0}
+
+        def script(path, params, headers):
+            if path.endswith("/MapServer"):
+                seen["roots"] += 1
+                failing = (seen["roots"] == nth if nth
+                           else int(rng.random() * m) < bad)
+                return {"body": ERR if failing else map_root()}
+            return {"body": GOOD}
+        return script
+    stub = serve(root_pool(8, 2, random.Random(5)))
+    res = survey([target(stub, "/rp/MapServer")], opts(rounds=17, needed=17),
+                 make_fetcher(None, 5))[0]
+    check(res.verdict == FAIL and exit_code([res]) == 1
+          and root_of(res)[0] == SERVER_ERROR
+          and all(s.failed == 0 for s in res.stats)
+          and res.requests == 17 + 17
+          and "root: SERVER_ERROR" in "\n".join(describe([res], ctx)),
+          "a service root that fails on 2 of 8 instances fails the run "
+          "though every layer query passes  <-- pinned defect")
+    stub = serve(root_pool(1, 0, None, nth=3))
+    res = survey([target(stub, "/rp/MapServer")], opts(rounds=5),
+                 make_fetcher(None, 5))[0]
+    check(res.verdict == FAIL and root_of(res)[0] == SERVER_ERROR
+          and res.requests == 10,
+          "a root that fails only on the third round is still a FAIL")
+    stub = serve(root_pool(1, 0, None, nth=2))
+    res = survey([target(stub, "/rp/MapServer")], opts(rounds=5),
+                 make_fetcher(None, 5), stop_on_fail=True)[0]
+    check(res.verdict == FAIL and res.requests == 4,
+          "a gate stops at the round a failed root shows in")
 
     # A map service that lists Map and Data is queried, and its export was
     # never asked. An export that fails on 2 of 8 instances passed with exit 0.
@@ -2684,13 +2735,13 @@ def _assertions(tmp, passed, failed, stubs):
           and by_name["view overview"].failed > 0
           and by_name["view overview"].kinds == {NOT_IMAGE: by_name[
               "view overview"].failed}
-          and res.requests == 1 + 17 * 3,
+          and res.requests == 17 + 17 * 3,
           "a map service with Data whose export fails on 2 of 8 instances "
           "fails  <-- pinned defect")
     stub = serve(data_pool(1, 0, random.Random(5), image=blank))
     res = survey([target(stub, "/db/MapServer")], opts(rounds=2),
                  make_fetcher(None, 5))[0]
-    check(res.verdict == PASS and res.requests == 7,
+    check(res.verdict == PASS and res.requests == 8,
           "a valid blank map export is not a failed probe, because a sparse "
           "view draws one  <-- pinned defect")
 
@@ -2823,11 +2874,11 @@ def _assertions(tmp, passed, failed, stubs):
           "a 3xx status, 300 through 399, is a redirect and no other is")
     stub = serve(pool(1, 0, random.Random(1)))
     check(len(survey([target(stub, "/svc/MapServer")],
-                     opts(rounds=3, max_requests=4), make_fetcher(None, 5))
+                     opts(rounds=3, max_requests=6), make_fetcher(None, 5))
               [0].stats) == 1,
           "a plan exactly equal to --max-requests is sampled")
     raises(lambda: survey([target(stub, "/svc/MapServer")],
-                          opts(rounds=3, max_requests=3),
+                          opts(rounds=3, max_requests=5),
                           make_fetcher(None, 5)),
            "and a plan one over it is refused")
     code, out, err = run([ok_stub.url("/svc/MapServer"), "--max-requests",
@@ -2880,7 +2931,7 @@ def _assertions(tmp, passed, failed, stubs):
           "the report numbers its targets from 1")
     code, out, err = run([ok_stub.url("/svc/MapServer"), "--max-requests",
                           "5"])
-    check("the plan is 18 request(s) (1 probe(s) over 17 round(s), plus 1 to "
+    check("the plan is 34 request(s) (1 probe(s) over 17 round(s), plus 17 to "
           "read the service roots), over --max-requests 5." in err,
           "a refused plan says how many requests it was and why")
     code, out, err = run([ok_stub.url("/svc/MapServer"), "--layers", "a,1"])
