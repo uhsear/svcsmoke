@@ -293,7 +293,8 @@ def classify_features(body, token=None):
     if not isinstance(features, list):
         return NO_FEATURES, "JSON with no features array"
     if not features:
-        return NO_FEATURES, "features array is empty"
+        return NO_FEATURES, ("features array is empty (leave a layer that is "
+                              "meant to be empty out with --layers)")
     return OK, ""
 
 
@@ -767,9 +768,9 @@ def describe(results, context):
     lines.append("")
     verdicts = [r.verdict for r in results]
     if FAIL in verdicts:
-        lines.append("VERDICT: FAILED. %d target(s) returned no feature or "
-                     "image on at least one request. They are not healthy, "
-                     "whatever their state says." % verdicts.count(FAIL))
+        lines.append("VERDICT: FAILED. %d target(s) returned no feature, no "
+                     "image or an invalid layer on at least one request. They "
+                     "are not healthy, whatever their state says." % verdicts.count(FAIL))
     elif NOTHING in verdicts or not results:
         lines.append("VERDICT: NOTHING PROBED. At least one target had no "
                      "layer or view to ask, so a clean exit would mean "
@@ -1234,6 +1235,8 @@ def _assertions(tmp, passed, failed, stubs):
         "  <-- pinned defect")
     check(classify_features(b'{"features": []}')[0] == NO_FEATURES,
           "an empty features array is not a pass")
+    check("--layers" in classify_features(b'{"features": []}')[1],
+          "an empty layer failure names the way to leave it out  <-- pinned defect")
     check(classify_features(b'{"count": 48}')[0] == NO_FEATURES,
           "a count with no feature is not a pass  <-- pinned defect")
     kind, detail = classify_features(HTML)

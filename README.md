@@ -100,10 +100,10 @@ PASS  a token echoed in the Content-Type header is removed before the type is cu
 ...
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-309 assertions, 0 failed
+310 assertions, 0 failed
 ```
 
-The full run prints all 309 assertions. Each `...` line above is where this block is cut.
+The full run prints all 310 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -162,7 +162,7 @@ git clone https://github.com/uhsear/svcsmoke.git
 
 The self-test starts small HTTP servers on `127.0.0.1` and sends them requests. It needs no
 network and no credentials. It takes about 10 seconds on Windows (Python 3.13) and 3 seconds on
-Linux (Python 3.12), because a few cases wait on a timeout. It prints the same 309
+Linux (Python 3.12), because a few cases wait on a timeout. It prints the same 310
 assertions on Windows (Python 3.13.2), on Python 3.9.25 and on Ubuntu (Python 3.12.3). All three
 outputs are identical line for line, apart from the line endings.
 `coverage run --branch svcsmoke.py --self-test` reports 100 percent of lines and branches.
@@ -311,7 +311,7 @@ sampling: 17 round(s) miss a fault on 1/4 of the instances with probability 0.00
 1. FAIL         http://127.0.0.1:8803/arcgis/rest/services/Pool/MapServer  2 probe(s), 35 request(s)
      layer 1: 2 of 17 failed (11.8%): SERVER_ERROR x2. First: error property: Unable to complete operation. (code 500) (HTTP 200, recorded only)
 
-VERDICT: FAILED. 1 target(s) returned no feature or image on at least one request. They are not healthy, whatever their state says.
+VERDICT: FAILED. 1 target(s) returned no feature, no image or an invalid layer on at least one request. They are not healthy, whatever their state says.
 $ echo $?
 1
 ```
@@ -393,7 +393,7 @@ sampling: 17 round(s) miss a fault on 1/4 of the instances with probability 0.00
      view overview: 6 of 17 failed (35.3%): NOT_IMAGE x6. First: content type 'text/html', page titled 'Service Error' (HTTP 200, recorded only)
      view detail: 5 of 17 failed (29.4%): NOT_IMAGE x5. First: content type 'text/html', page titled 'Service Error' (HTTP 200, recorded only)
 
-VERDICT: FAILED. 1 target(s) returned no feature or image on at least one request. They are not healthy, whatever their state says.
+VERDICT: FAILED. 1 target(s) returned no feature, no image or an invalid layer on at least one request. They are not healthy, whatever their state says.
 $ echo $?
 1
 ```
@@ -401,9 +401,11 @@ $ echo $?
 A map export gets no byte minimum, because a sparse view of a healthy service is a valid blank
 image. Only the signature and the content type are checked.
 
-**A layer that is not a feature layer.** Esri's Map Service example response shows `type` and
+**A layer that is not a feature layer.** Esri's Map Service example responses show `type` and
 `geometryType` on a root `layers` entry, with the value `Feature Layer` ([Map
-Service][mapservice], read on 2026-11-10). The page shows no other value. A root entry whose
+Service][mapservice], read on 2026-11-10). The page's schema lists only `id`, `name`,
+`defaultVisibility`, `parentLayerId`, `subLayerIds`, `minScale` and `maxScale`, and no other
+`type` value appears. A root entry whose
 `type` is a string other than `Feature Layer`, such as a raster layer, is not known to answer a
 query. The tool reads its own description (`layer N resource`) in each round and sends it no
 query. An entry with no `type` is queried as before. The rule also applies to ids named with
@@ -434,7 +436,7 @@ sampling: 17 round(s) miss a fault on 1/4 of the instances with probability 0.00
 1. FAIL         http://127.0.0.1:8830/arcgis/rest/services/Drawfault/MapServer  4 probe(s), 69 request(s)
      layer 1 resource: 4 of 17 failed (23.5%): SERVER_ERROR x4. First: error property: Unable to complete operation. (code 500) (HTTP 200, recorded only)
 
-VERDICT: FAILED. 1 target(s) returned no feature or image on at least one request. They are not healthy, whatever their state says.
+VERDICT: FAILED. 1 target(s) returned no feature, no image or an invalid layer on at least one request. They are not healthy, whatever their state says.
 $ echo $?
 1
 ```
@@ -452,7 +454,7 @@ sampling: 17 round(s) miss a fault on 1/4 of the instances with probability 0.00
      layer 1 resource: 5 of 17 failed (29.4%): SERVER_ERROR x5. First: error property: Unable to complete operation. (code 500) (HTTP 200, recorded only)
      layer 1: 6 of 17 failed (35.3%): SERVER_ERROR x6. First: error property: Unable to complete operation. (code 500) (HTTP 200, recorded only)
 
-VERDICT: FAILED. 1 target(s) returned no feature or image on at least one request. They are not healthy, whatever their state says.
+VERDICT: FAILED. 1 target(s) returned no feature, no image or an invalid layer on at least one request. They are not healthy, whatever their state says.
 $ echo $?
 1
 ```
@@ -494,7 +496,7 @@ sampling: 17 round(s) miss a fault on 1/4 of the instances with probability 0.00
      view overview: 7 of 17 failed (41.2%): NOT_IMAGE x7. First: content type 'text/html', page titled 'Service Error' (HTTP 200, recorded only)
      view detail: 4 of 17 failed (23.5%): NOT_IMAGE x4. First: content type 'text/html', page titled 'Service Error' (HTTP 200, recorded only)
 
-VERDICT: FAILED. 1 target(s) returned no feature or image on at least one request. They are not healthy, whatever their state says.
+VERDICT: FAILED. 1 target(s) returned no feature, no image or an invalid layer on at least one request. They are not healthy, whatever their state says.
 $ echo $?
 1
 ```
@@ -518,7 +520,7 @@ sampling: 1 round(s) miss a fault on 1/4 of the instances with probability 0.750
 1. FAIL         http://127.0.0.1:1/arcgis/rest/services/Gone/MapServer  0 probe(s), 1 request(s)
      root: TRANSPORT, no response: ConnectionRefusedError (errno 10061)
 
-VERDICT: FAILED. 1 target(s) returned no feature or image on at least one request. They are not healthy, whatever their state says.
+VERDICT: FAILED. 1 target(s) returned no feature, no image or an invalid layer on at least one request. They are not healthy, whatever their state says.
 $ echo $?
 1
 ```
@@ -539,7 +541,7 @@ sampling: 17 round(s) miss a fault on 1/4 of the instances with probability 0.00
 1. FAIL         http://127.0.0.1:8806/arcgis/rest/services/Secure/MapServer  0 probe(s), 1 request(s)
      root: SERVER_ERROR, error property: Token Required (code 499) (HTTP 200, recorded only)
 
-VERDICT: FAILED. 1 target(s) returned no feature or image on at least one request. They are not healthy, whatever their state says.
+VERDICT: FAILED. 1 target(s) returned no feature, no image or an invalid layer on at least one request. They are not healthy, whatever their state says.
 $ echo $?
 1
 ```
@@ -642,7 +644,7 @@ sampling: 17 round(s) miss a fault on 1/4 of the instances with probability 0.00
 2. FAIL         [app] http://127.0.0.1:8808/arcgis/rest/services/Pool/MapServer  2 probe(s), 9 request(s)
      layer 1: 1 of 4 failed (25.0%): SERVER_ERROR x1. First: error property: Unable to complete operation. (code 500) (HTTP 200, recorded only)
 
-VERDICT: FAILED. 1 target(s) returned no feature or image on at least one request. They are not healthy, whatever their state says.
+VERDICT: FAILED. 1 target(s) returned no feature, no image or an invalid layer on at least one request. They are not healthy, whatever their state says.
 GATE: CLOSED. Do not restart 'web' yet; the tiers before it are not proven healthy.
 $ echo $?
 1
@@ -925,7 +927,7 @@ sampling: 17 round(s) miss a fault on 1/4 of the instances with probability 0.00
      view overview: 17 of 17 failed (100.0%): NOT_IMAGE x17. First: content type 'application/json; charset=utf-8', body starts '{"error": {"code": 500, "message": "Unable to complete o... (HTTP 200, recorded only)
      view detail: 17 of 17 failed (100.0%): NOT_IMAGE x17. First: content type 'application/json; charset=utf-8', body starts '{"error": {"code": 500, "message": "Unable to complete o... (HTTP 200, recorded only)
 
-VERDICT: FAILED. 1 target(s) returned no feature or image on at least one request. They are not healthy, whatever their state says.
+VERDICT: FAILED. 1 target(s) returned no feature, no image or an invalid layer on at least one request. They are not healthy, whatever their state says.
 $ echo $?
 1
 ```
@@ -968,7 +970,10 @@ $ echo $?
   `VERDICT`, which is above the error.
 - **A features list** passes when it is not empty, even if its entries are `null` or `{}`. The
   tool checks that a feature came back and not that its content is valid.
-- **A healthy layer with no features** fails its probe, by design. Leave it out with `--layers`.
+- **A healthy layer with no features** fails its probe, by design: the failure this tool exists to
+  catch is a request that returns nothing, and an empty answer cannot be told from that fault. The
+  failure line names the cause and `--layers` leaves the layer out. A new layer that is still empty
+  needs that flag until it holds a row.
 - **A group layer** is not probed itself, only its sub-layers.
 - **Stand-alone tables** in the root `tables` array are never probed. A service that holds only
   tables ends as NOTHING with exit 4. A table that fails to load is not seen.
@@ -1031,11 +1036,20 @@ $ echo $?
   Both fail closed, and neither is a finding. Neither is a realistic input.
 - **The restfake transcripts** in this README were re-run after the layer type rule, and every
   line matched. The restfake root lists no layer `type`, so the plans they show did not change.
-- **A closed output pipe.** If stdout is closed early, for example by `| head -1`, Python fails
+- **A closed output pipe.** If stdout is closed before the tool exits, Python fails
   to flush stdout at exit and the process ends with exit 120 and an "Exception ignored" line on
-  stderr, with no traceback. I measured 120 on Windows with Python 3.13 and on Linux with Python
-  3.12. The verdict or gate code is lost, but 120 is not zero, so `svcsmoke ... && restart-app`
+  stderr, with no traceback. I measured 120 on Windows with Python 3.13 by closing the read end of
+  the pipe. A short report piped to `head -1` is flushed before `head` closes, and exited 1 in
+  every run. The verdict or gate code is lost, but 120 is not zero, so `svcsmoke ... && restart-app`
   still stops. Read the whole output when the exit code gates a restart.
+- **No floor on `--interval`.** Any value above zero is accepted. `--max-requests` caps one survey
+  and not the polls, so `--wait 3600 --interval 0.001` repeats the whole survey as fast as the
+  tier answers, against a tier that is restarting. Keep the interval at seconds.
+- **Secrets typed after a wrong flag.** The tool removes only the value of `SVCSMOKE_TOKEN` and any
+  `token=` parameter from usage errors. With `SVCSMOKE_TOKEN` unset, a secret typed after an
+  unknown flag is printed by argparse.
+- **A very short token** is scrubbed out of the tool's own words too, so an error line can read
+  oddly. That hides text and leaks nothing. Use a real token.
 - **Interrupts.** A Ctrl-C during `--wait` is not caught. The process ends with Python's own
   interrupt status, which is not in the exit code table.
 - **The image signature `BM`.** A body that starts with those two bytes, under an `image/` content
