@@ -238,14 +238,29 @@ def scrub(text, token):
     return _TOKEN_PARAM.sub(r"\1[token]", text)
 
 
+def token_forms(token):
+    """The token as typed, then as a JSON string writes it, with and without
+    an escaped slash, or with every character as a unicode escape. A body
+    that is cut off or is not JSON is scrubbed as
+    bytes, so every form a server may echo is listed here, longest first."""
+    if not token:
+        return []
+    escaped = json.dumps(token)[1:-1]
+    forms = set([token, escaped, token.replace("/", "\\/"),
+                 escaped.replace("/", "\\/")])
+    for digits in ("%04x", "%04X"):
+        forms.add("".join("\\u" + digits % ord(c) for c in token))
+    return sorted(forms, key=len, reverse=True)
+
+
 def scrub_body(body, token):
     """A reply body safe to quote: no token value and no token= parameter.
 
     This runs on the whole body before any text is cut to a length. A token
     longer than the cut would otherwise survive as a prefix.
     """
-    if token:
-        body = body.replace(token.encode("ascii"), b"[token]")
+    for form in token_forms(token):
+        body = body.replace(form.encode("ascii"), b"[token]")
     return _TOKEN_PARAM_BYTES.sub(rb"\1[token]", body)
 
 
@@ -915,7 +930,20 @@ def make_fetcher(token, timeout, max_body=MAX_BODY):
     return fetch
 
 
-def sample_target(result, rounds, fetch, bust, min_bytes, token, stop_on_fail):
+def make_nonce(run, label):
+    """The throwaway value that makes a request URL new. `run` names one
+    survey, so a cache that kept the answers of an earlier run cannot serve
+    them again."""
+    return "%s-%s" % (run, label) if run else str(label)
+
+
+def new_run_id():
+    """A value that differs for every survey, and so for every --wait poll."""
+    return "%x%04x" % (int(time.time() * 1000), random.getrandbits(16))
+
+
+def sample_target(result, rounds, fetch, bust, min_bytes, token, stop_on_fail,
+                  run=""):
     """Ask every probe once per round. With stop_on_fail, end the round a
     failure appears in, because a gate that is already closed gains nothing
     from hammering a tier that is coming back up."""
@@ -923,7 +951,8 @@ def sample_target(result, rounds, fetch, bust, min_bytes, token, stop_on_fail):
     result.stats = [ProbeStat(p.name) for p in result.plan]
     for number in range(rounds):
         for probe, stat in zip(result.plan, result.stats):
-            reply = fetch(probe_url(base, probe, number if bust else None))
+            reply = fetch(probe_url(base, probe,
+                                  make_nonce(run, number) if bust else None))
             result.requests += 1
             # A view is judged on image bytes, whatever the service kind.
             kind = IMAGE_SERVER if probe.layer is None else result.target.kind
@@ -942,9 +971,13 @@ def survey(targets, options, fetch, stop_on_fail=False):
     Raises ValueError when the plan is over the budget, before any sampling.
     """
     results = []
+    run = options.get("run", "")
     for target in targets:
         result = TargetResult(target)
-        reply = fetch(target.url + "?f=json")
+        root_url = target.url + "?f=json"
+        if options["bust"]:
+            root_url += "&_svcsmoke=" + make_nonce(run, "root")
+        reply = fetch(root_url)
         result.requests += 1
         doc, failure = judge_root(reply, options["token"])
         if failure:
@@ -966,7 +999,8 @@ def survey(targets, options, fetch, stop_on_fail=False):
     for result in results:
         if result.plan:
             sample_target(result, options["rounds"], fetch, options["bust"],
-                          options["min_bytes"], options["token"], stop_on_fail)
+                          options["min_bytes"], options["token"], stop_on_fail,
+                          run)
         result.verdict = target_verdict(result, options["rounds"],
                                         options["needed"])
     return results
@@ -1695,6 +1729,26 @@ def _assertions(tmp, passed, failed, stubs):
            make_fetcher(None, 5))
     check(all("_svcsmoke" not in r[1] for r in stub.requests),
           "with cache busting off no extra parameter is sent")
+    stub = serve(pool(1, 0, random.Random(1)))
+    survey([target(stub, "/svc/MapServer")], dict(opts(rounds=2, bust=True),
+                                                  run="r1"),
+           make_fetcher(None, 5))
+    survey([target(stub, "/svc/MapServer")], dict(opts(rounds=2, bust=True),
+                                                  run="r2"),
+           make_fetcher(None, 5))
+    seen = [r[1].get("_svcsmoke") for r in stub.requests]
+    check(seen == ["r1-root", "r1-0", "r1-1", "r2-root", "r2-0", "r2-1"],
+          "the nonce names the run and the service root is busted too, so a "
+          "cache that kept an earlier run cannot answer  <-- pinned defect")
+    check(make_nonce("", 3) == "3" and make_nonce("ab", "root") == "ab-root"
+          and new_run_id() != new_run_id(),
+          "a run id differs on every call, and no run id leaves the nonce "
+          "as the bare round number  <-- pinned defect")
+    stub = serve(pool(1, 0, random.Random(1)))
+    survey([target(stub, "/svc/MapServer")], opts(rounds=1),
+           make_fetcher(None, 5))
+    check(stub.requests[0][1] == {"f": "json"},
+          "with cache busting off the root request carries only f=json")
 
     stub = serve(lambda path, params, headers: {
         "status": 503, "body": HTML, "ctype": "text/html"})
@@ -2729,6 +2783,24 @@ def _assertions(tmp, passed, failed, stubs):
                                  slash)[1],
           "a token the server echoes with its slash JSON-escaped is still "
           "removed")
+    cut_token = 'ab/cd"ef' + chr(92) + 'gh1234567890XYZ'
+    json_form = json.dumps(cut_token)[1:-1]
+    for what, echoed in (
+            ("a slash", json_form.replace("/", chr(92) + "/")),
+            ("a quote and a backslash", json_form),
+            ("every character as a lower case unicode escape", "".join(
+                chr(92) + "u%04x" % ord(c) for c in cut_token)),
+            ("every character as an upper case unicode escape", "".join(
+                chr(92) + "u%04X" % ord(c) for c in cut_token))):
+        body = ('{"error": {"message": "bad token %s"' % echoed).encode()
+        detail = judge(MAP_SERVER, Reply(200, "", body), 1, cut_token)[1]
+        check("1234567890" not in detail and "[token]" in detail,
+              "a token written with JSON escapes inside a body that is cut "
+              "off is removed, %s  <-- pinned defect" % what)
+    check(token_forms(None) == []
+          and token_forms("a/b")[-1] == "a/b"
+          and len(token_forms("a/b")) == 4,
+          "the token forms are empty with no token and longest first")
     quoted = json.dumps({"error": {"message": "bad TOK%2Fabc9"}}).encode()
     check("TOK%2Fabc9" in judge(MAP_SERVER, Reply(200, "", quoted), 1,
                                 slash)[1],
@@ -3175,10 +3247,11 @@ def _run(argv):
     try:
         if gate:
             results, code = run_gate(
-                lambda: survey(targets, options, fetch, True), args.wait,
+                lambda: survey(targets, dict(options, run=new_run_id()),
+                               fetch, True), args.wait,
                 args.interval, time.monotonic, time.sleep, _progress)
         else:
-            results = survey(targets, options, fetch)
+            results = survey(targets, dict(options, run=new_run_id()), fetch)
             code = exit_code(results)
     except ValueError as exc:
         return _usage(scrub(str(exc), token))

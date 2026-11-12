@@ -59,6 +59,8 @@ PASS  a redirect is a failed probe, is not followed, and its query is dropped  <
 ...
 PASS  a body shorter than its Content-Length fails, so a half-sent image cannot pass  <-- pinned defect
 ...
+PASS  the nonce names the run and the service root is busted too, so a cache that kept an earlier run cannot answer  <-- pinned defect
+...
 PASS  a service whose only layer is a group probed nothing, exit 4  <-- pinned defect
 PASS  a clean run with too few rounds is UNDERSAMPLED, not a pass  <-- pinned defect
 ...
@@ -98,12 +100,14 @@ PASS  a valid blank map export is not a failed probe, because a sparse view draw
 PASS  a redirect to an address with a password does not print it  <-- pinned defect
 PASS  a token echoed in the Content-Type header is removed before the type is cut  <-- pinned defect
 ...
+PASS  a token written with JSON escapes inside a body that is cut off is removed, a slash  <-- pinned defect
+...
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-327 assertions, 0 failed
+335 assertions, 0 failed
 ```
 
-The full run prints all 327 assertions. Each `...` line above is where this block is cut.
+The full run prints all 335 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -162,7 +166,7 @@ git clone https://github.com/uhsear/svcsmoke.git
 
 The self-test starts small HTTP servers on `127.0.0.1` and sends them requests. It needs no
 network and no credentials. It takes about 10 seconds on Windows (Python 3.13) and 3 seconds on
-Linux (Python 3.12), because a few cases wait on a timeout. It prints the same 327
+Linux (Python 3.12), because a few cases wait on a timeout. Those times depend on the machine. It prints the same 335
 assertions on Windows (Python 3.13.2), on Python 3.9.25 and on Ubuntu (Python 3.12.3). All three
 outputs are identical line for line, apart from the line endings.
 `coverage run --branch svcsmoke.py --self-test` reports 100 percent of lines and branches.
@@ -580,7 +584,7 @@ The tool takes these steps so that the token reaches the server and nobody else:
 - The token value, in its literal and JSON-escaped forms, and any `token=` parameter are removed from every line the tool prints and
   from the report. The tool removes them from the whole reply body before it cuts the text to a
   length, so a token longer than the cut does not survive as a prefix. It scrubs the decoded text of
-  an error message again before the cut, so a token that the body writes with JSON escapes (`\/` or `\uXXXX`) does not survive as a prefix either. The self-test has servers
+  an error message again before the cut, so a token that the body writes with JSON escapes (`\/` or `\uXXXX`) does not survive as a prefix either. The whole-body scrub also removes the token as a JSON string writes it (a quote or a backslash escaped, a slash as `\/`, or every character as `\uXXXX`), so a JSON body that is cut off does not show it in the `body starts` line. The self-test has servers
   that echo a 251 character token back in an error message and in an HTML page, and in both
   escaped forms, and greps the screen and the report for it. A token that a server echoes in a `Content-Type` header is
   removed before the type is cut to 40 characters. An unexpected error and a usage error are
@@ -797,10 +801,13 @@ $ echo $?
 0
 ```
 
-Every round carries a different throwaway parameter, `_svcsmoke=<round>`, counted from 0. It is for
-a cache that sits in front of the server, such as a reverse proxy, which would answer a repeated
-URL itself. The self-test checks that the parameter changes every round and is absent with
-`--no-bust-cache`. I did not test it against a real server, and I did not check that a server
+Every request carries a throwaway parameter, `_svcsmoke=<run>-<round>`, counted from 0. The run
+part is new for every run and for every `--wait` poll, and the service root request carries it
+too (`<run>-root`). It is for a cache that sits in front of the server, such as a reverse proxy,
+which would answer a repeated URL itself. A parameter that restarted at 0 on every run would let a
+cache that kept the answers of an earlier run serve them again, so a service that broke since then
+would pass. The self-test checks that the parameter changes every round and every run, that the
+root is busted, and that the parameter is absent with `--no-bust-cache`. I did not test it against a real server, and I did not check that a server
 ignores an unknown parameter.
 
 With `--no-bust-cache` the tool cannot tell a cached answer from a fresh one. A cache that answers
@@ -911,7 +918,9 @@ print("serving on %d" % stub.port, flush=True)
 time.sleep(3600)
 ```
 
-The seed was 33 for the runs on ports 8802, 8803 and 8808, and 5 for all the others. Seed 33 is
+The examples use fixed ports 8802 to 8835. Pick free ports for your own runs: a port that another
+process already holds can answer with that process's replies. The seed was 33 for the runs on
+ports 8802, 8803 and 8808, and 5 for all the others. Seed 33 is
 the one where 8 rounds miss the fault on a fresh `Pool` and 17 rounds catch it.
 
 ## Also run against restfake
@@ -1015,10 +1024,10 @@ $ echo $?
   URL-encoded (`/` as `%2F`), with only some characters percent-encoded, in base64, or with its
   letters in another case is not scrubbed. The self-test shows the literal and escaped forms.
   I did not see a real Esri error body echo the token, but I had no live server to check. A token
-  with a double quote or backslash that a non-JSON body echoes is not removed either. A token that
-  a server echoes with a JSON escape inside an invalid or cut-off JSON body is not removed
-  either, because the decoded-text scrub runs only on JSON that parses. The text would show in
-  the `body starts` line.
+  that a server writes with only some characters as `\uXXXX` escapes inside a body that is not
+  valid JSON, such as a cut-off body, is not removed, because the decoded-text scrub runs only on JSON that parses. The
+  text would show in the `body starts` line. The service URL is printed as typed, with no scrub,
+  so do not put a token in the URL path.
 - **Proxies.** A service that is reachable only through a mandatory HTTP proxy fails every probe
   with `TRANSPORT`, because the tool ignores the proxy environment variables on purpose.
 - **Report timing.** The report file is opened only after all sampling ends, so a path that
@@ -1049,7 +1058,9 @@ $ echo $?
 - **Huge numbers.** A `--rounds` of more than 308 digits ends in exit 70 against a service with
   no plan (the text `1e308` is a usage error, exit 64). So does a root extent corner with an
   integer of more than about 308 digits. Both end with an `OverflowError` traceback and exit 70.
-  Both fail closed, and neither is a finding. Neither is a realistic input.
+  Both fail closed, and neither is a finding. Neither is a realistic input. Against a service
+  that has a plan, the same huge `--rounds` is refused with exit 64 by the `--max-requests`
+  check, and the error line prints the whole number.
 - **The restfake transcripts** in this README were re-run after the layer type rule, and every
   line matched. The restfake root lists no layer `type`, so the plans they show did not change.
 - **A closed output pipe.** If stdout is closed before the tool exits, Python fails
@@ -1112,8 +1123,10 @@ $ echo $?
   not probed. "Each layer" in this tool means each layer in the root `layers` array.
 - **Usage text** wraps to the width of the terminal, so the `--ap` block above can wrap
   differently on your screen.
-- **A port that is not a number.** A URL such as `https://host:text/x/MapServer` is refused with
-  Python's own message, which quotes the port text. Do not type a secret there.
+- **A port that is not a number.** A URL such as `https://host:text/x/MapServer` is refused
+  with a fixed message that does not quote the port text. A service URL that ends in a slash is
+  accepted and probed as the URL without it. Only a layer URL or a wrongly cased kind is a usage
+  error.
 - **A bad tier line is quoted.** The refusal for a tier URL that is not a URL quotes up to 60
   characters of that line, so do not point `--tiers` at a file that holds secrets.
 - **Trust the tiers file.** The tool sends the one token to every `https` host in the file and
