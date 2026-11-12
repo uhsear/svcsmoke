@@ -2071,8 +2071,9 @@ def _assertions(tmp, passed, failed, stubs):
             check(code == 64 and out == "" and "SECRETtok123" not in err
                   and argv[0].split("=")[0] in err,
                   "a secret typed after the wrong flag is not echoed in the "
-                  "usage error, %s a token set: %s  <-- pinned defect"
-                  % ("with" if known else "with no", argv[0].split("=")[0]))
+                  "usage error, %s token set: %s  <-- pinned defect"
+                  % ("with a" if known else "with no",
+                     argv[0].split("=")[0]))
     # Every other line main() prints from typed text goes through scrub too.
     tok = "SECRETtok9876543210" + "Q" * 50
     tiers_file = os.path.join(tmp, "leak_tiers.txt")
@@ -3004,7 +3005,7 @@ def _parse(argv):
     ap.add_argument("--no-bust-cache", dest="no_bust_cache",
                     action="store_true",
                     help="do not add a different throwaway parameter to each "
-                         "round. Without it a cache keyed on the URL can "
+                         "round. With it a cache keyed on the URL can "
                          "answer every round, and a PASS says so.")
     ap.add_argument("--max-requests", dest="max_requests", type=int,
                     default=DEFAULT_MAX_REQUESTS,
