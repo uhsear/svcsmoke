@@ -959,7 +959,7 @@ $ echo $?
   transparent blank PNG, about 700 bytes, falls under it.
 - **Timeouts.** `--timeout` goes to the socket, so it is a limit on each blocking operation and
   not on the whole response ([urllib.request][urllib]). A server that sends one byte every few
-  seconds can outlast it.
+  seconds can outlast it, so a trickling server can hold the run open.
 - **TLS.** The default certificate checks apply, and no flag turns them off. A failed handshake
   is a `TRANSPORT` failure. A private certificate authority is a matter of Python's and
   OpenSSL's own configuration, and I did not test one.
@@ -973,7 +973,9 @@ $ echo $?
 - **A healthy layer with no features** fails its probe, by design: the failure this tool exists to
   catch is a request that returns nothing, and an empty answer cannot be told from that fault. The
   failure line names the cause and `--layers` leaves the layer out. A new layer that is still empty
-  needs that flag until it holds a row.
+  needs that flag until it holds a row. A layer whose own resource returns an error while its
+  query still reads a feature passes by default, so "invalid layer" here means a layer that cannot
+  answer a query. Add `--layer-resources` to fail on the description too.
 - **A group layer** is not probed itself, only its sub-layers.
 - **Stand-alone tables** in the root `tables` array are never probed. A service that holds only
   tables ends as NOTHING with exit 4. A table that fails to load is not seen.
@@ -1008,7 +1010,10 @@ $ echo $?
   URL-encoded (`/` as `%2F`), with only some characters percent-encoded, in base64, or with its
   letters in another case is not scrubbed. The self-test shows the literal and escaped forms.
   I did not see a real Esri error body echo the token, but I had no live server to check. A token
-  with a double quote or backslash that a non-JSON body echoes is not removed either.
+  with a double quote or backslash that a non-JSON body echoes is not removed either. A token that
+  a server echoes with a JSON escape inside an invalid or cut-off JSON body is not removed
+  either, because the decoded-text scrub runs only on JSON that parses. The text would show in
+  the `body starts` line.
 - **Proxies.** A service that is reachable only through a mandatory HTTP proxy fails every probe
   with `TRANSPORT`, because the tool ignores the proxy environment variables on purpose.
 - **Report timing.** The report file is opened only after all sampling ends, so a path that
@@ -1018,9 +1023,15 @@ $ echo $?
   path that you name.
 - **A new connection for every request.** The tool opens a new connection for each request. On
   Windows each closed connection keeps its port in TIME_WAIT for a few minutes. A burst of runs
-  can use every ephemeral port, and a request then shows `OSError (errno 10048)` as a false
+  can use every ephemeral port (the length of TIME_WAIT and the meaning of errno 10048 are
+  unverified here, because I cite no Microsoft page for them), and a request then shows
+  `OSError (errno 10048)` as a false
   TRANSPORT failure. The self-test sends more than 600 requests to its stubs and makes the same demand. Wait a
   minute and run again. A self-test that fails for this reason prints FAIL lines and exits 1.
+- **Stub ports.** Windows lets several processes listen on one loopback port when a server sets
+  address reuse, and the stub does. Pick a free port for `stub.py`. A taken port can still bind
+  and answer with another server's replies, which shows as a wrong error text and not as a bind
+  failure.
 - **CI.** Read the last line of the self-test (`N assertions, 0 failed`) as well as the exit
   code. A CI step must require the text `0 failed`, because a self-test that printed nothing
   would also exit 0. A red self-test exits 1, the same code as a failed service.
@@ -1058,6 +1069,8 @@ $ echo $?
   run with exit 64 and an `idna` message. It is not reported as a failed service.
 - **Map services with Data.** A map service that lists `Map` and `Data` is queried layer by layer
   and exported in the same two views, so an export that fails on bad instances fails the run.
+  A FeatureServer whose capabilities leave out `Query` is still queried and fails, because only a
+  MapServer root is checked for `Data`.
   A `capabilities` string that has `Data` and not `Map` is only queried. A root with no
   `capabilities` string is only queried, because nothing says export works. A root with no extent
   is only queried. Which strings a live server lists, I did not check.
@@ -1080,10 +1093,13 @@ $ echo $?
   (`redirected to `). The verdict is still FAIL.
 - **Loopback addresses other than `localhost`, `127.0.0.1` and `::1`**, such as `127.0.0.2`, are
   refused for a plain `http` URL when a token is set. That fails closed.
-- **A tier name that starts with `=`, `+`, `-`, `@`, tab or CR** is written to the report as
-  typed, so a spreadsheet reads it as a formula. Name tiers with letters.
-- **A tier name is printed and written as typed.** The tool does not scrub it, so do not use the
-  token as a tier name. Every text that comes from a server is scrubbed.
+- **A tier name that starts with `=`, `+`, `-` or `@`** is written to the report as
+  typed, so a spreadsheet reads it as a formula. Name tiers with letters. A tab or CR cannot
+  start a tier name, because the tiers file parser refuses it.
+- **A tier name is printed and written as typed.** The tool does not scrub it or remove terminal
+  escape characters from it, so do not use the token as a tier name, and do not put control codes
+  in a tiers file you did not write. Every text that comes from a server is scrubbed and made
+  printable ASCII.
 - **Exit 1 does not tell a failed service from a probe the tool could not make.** A refused
   connection, a DNS failure, a TLS failure and a dead token all exit 1, as a real fault does.
 - **The plain-http token check trusts the name `localhost`,** not the address it resolves to.
