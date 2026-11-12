@@ -6,8 +6,9 @@ asks one instance, so a fault that sits on 2 of 8 instances is missed on the
 sweep, and eight rounds of the same sweep still miss it 10 percent of the time.
 This tool states that miss probability, refuses to call a run healthy when the
 rounds are too few to support the claim, and counts a probe as passed only when
-the body holds a feature or the bytes of an image. The HTTP status is recorded
-and never decides. A map service whose capabilities leave out Data cannot be
+the body holds a feature or the bytes of an image. An HTTP status of 200 never
+passes a probe by itself, and a status other than 200 fails a probe whose body
+is good. A map service whose capabilities leave out Data cannot be
 queried, so its export is probed for image bytes and each layer is asked to
 describe itself. A map service that lists Map and Data is queried and exported. A layer that fails to load fails the service, whichever probe
 finds it.
@@ -157,6 +158,7 @@ IMAGE_SIGNATURES = (
 LOOPBACK = ("localhost", "127.0.0.1", "::1")
 
 _TITLE = re.compile(r"<title[^>]*>\s*(.*?)\s*</title>", re.I | re.S)
+_URL_START = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
 _FAULTY = re.compile(r"^\s*(\d+)\s*/\s*(\d+)\s*$")
 _TOKEN_PARAM = re.compile(r"(?i)(token=)[^&\s\"']+")
 _TOKEN_PARAM_BYTES = re.compile(rb"(?i)(token=)[^&\s\"']+")
@@ -181,10 +183,10 @@ def parse_faulty(text):
     match = _FAULTY.match(text or "")
     if not match:
         raise ValueError("--faulty must look like 2/8 (faulty instances over "
-                         "all instances), not %r" % (text,))
+                         "all instances)")
     faulty, total = int(match.group(1)), int(match.group(2))
     if total < 1 or total > 10000 or faulty < 1 or faulty > total:
-        raise ValueError("--faulty %s needs 1 <= K <= M <= 10000" % text)
+        raise ValueError("--faulty needs 1 <= K <= M <= 10000")
     return faulty / float(total)
 
 
@@ -229,10 +231,11 @@ def tidy(text, limit=100):
 
 def scrub(text, token):
     """Text safe to print: no token value and no token= parameter."""
-    text = _TOKEN_PARAM.sub(r"\1[token]", text)
+    # The value goes first: a token that holds a quote or an ampersand would
+    # otherwise be cut at that character by the token= pattern.
     if token:
         text = text.replace(token, "[token]")
-    return text
+    return _TOKEN_PARAM.sub(r"\1[token]", text)
 
 
 def scrub_body(body, token):
@@ -241,10 +244,9 @@ def scrub_body(body, token):
     This runs on the whole body before any text is cut to a length. A token
     longer than the cut would otherwise survive as a prefix.
     """
-    body = _TOKEN_PARAM_BYTES.sub(rb"\1[token]", body)
     if token:
         body = body.replace(token.encode("ascii"), b"[token]")
-    return body
+    return _TOKEN_PARAM_BYTES.sub(rb"\1[token]", body)
 
 
 def describe_body(body):
@@ -402,8 +404,10 @@ def check_target(url, token):
     url = url.strip()
     # No message below quotes a URL that holds a password. A URL typed without
     # a scheme (user:pass@host/...) has no user name for urlsplit to find, so
-    # any "@" keeps the URL out of the message.
-    shown = "the URL" if "@" in url else tidy(scrub(url, token), 60)
+    # any "@" keeps the URL out of the message. A value with no scheme is not
+    # quoted either: it may be a secret typed in the wrong place.
+    shown = tidy(scrub(url, token), 60) if (
+        "@" not in url and _URL_START.match(url)) else "the value"
     if not all(33 <= ord(c) < 127 for c in url):
         raise ValueError("a URL may hold only printable ASCII characters and "
                          "no spaces. Percent-encode anything else")
@@ -417,7 +421,11 @@ def check_target(url, token):
                          % TOKEN_ENV)
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise ValueError("%s is not an http or https URL" % shown)
-    parts.port  # a bad port raises ValueError here
+    try:
+        parts.port
+    except ValueError:
+        # urllib quotes the port text, which may be a secret typed here.
+        raise ValueError("the port in a URL must be a number from 0 to 65535")
     kind = parts.path.rstrip("/").rsplit("/", 1)[-1]
     if kind not in SERVICE_KINDS:
         raise ValueError("%s does not end in %s" % (shown,
@@ -703,8 +711,8 @@ def tiers_before(tiers, name):
     """The tiers that must be healthy before `name` may restart."""
     names = [t[0] for t in tiers]
     if name not in names:
-        raise ValueError("no tier named '%s'. The file has: %s"
-                         % (name, ", ".join(names)))
+        raise ValueError("no tier has that name. The file has: %s"
+                         % ", ".join(names))
     index = names.index(name)
     if index == 0:
         raise ValueError("tier '%s' is the first, so no tier comes before "
@@ -753,7 +761,7 @@ def describe(results, context):
             len(result.plan), result.requests))
         if result.root:
             lines.append("     root: %s, %s%s" % (
-                result.root[0], result.root[1], status_note(result.root[2])))
+                result.root[0], result.root[1], status_note(result.root[2], result.root[0])))
         elif not result.plan:
             lines.append("     nothing probed: %s" % result.reason)
         for stat in result.stats:
@@ -764,7 +772,7 @@ def describe(results, context):
                              "%s%s" % (stat.name, stat.failed, stat.requests,
                                        100.0 * stat.failed / stat.requests,
                                        kinds, stat.first[1],
-                                       status_note(stat.first[2])))
+                                       status_note(stat.first[2], stat.first[0])))
     lines.append("")
     verdicts = [r.verdict for r in results]
     if FAIL in verdicts:
@@ -794,9 +802,14 @@ def describe(results, context):
     return lines
 
 
-def status_note(status):
-    """', HTTP 200' for a reply that had a status, else nothing."""
-    return "" if status is None else " (HTTP %d, recorded only)" % status
+def status_note(status, kind):
+    """', HTTP 200' for a reply that had a status, else nothing.
+
+    An HTTP_STATUS failure is decided by the status, and its detail names it.
+    """
+    if status is None or kind == HTTP_STATUS:
+        return ""
+    return " (HTTP %d, recorded only)" % status
 
 
 def report_rows(results):
@@ -1676,12 +1689,12 @@ def _assertions(tmp, passed, failed, stubs):
     nonces = [r[1].get("_svcsmoke") for r in stub.requests
               if r[0].endswith("query")]
     check(nonces == ["0", "1", "2", "3"],
-          "--bust-cache sends a different nonce each round, starting at 0")
+          "cache busting sends a different nonce each round, starting at 0")
     stub = serve(pool(1, 0, random.Random(1)))
     survey([target(stub, "/svc/MapServer")], opts(rounds=2),
            make_fetcher(None, 5))
     check(all("_svcsmoke" not in r[1] for r in stub.requests),
-          "without --bust-cache no extra parameter is sent")
+          "with cache busting off no extra parameter is sent")
 
     stub = serve(lambda path, params, headers: {
         "status": 503, "body": HTML, "ctype": "text/html"})
@@ -1830,7 +1843,7 @@ def _assertions(tmp, passed, failed, stubs):
             (base + ["--ou", prefixed, "--apply"], "--ou"),
             (base + ["--fault", "1/2"], "--fault"),
             (base + ["--round", "3"], "--round"),
-            (base + ["--bust", "--rounds", "1"], "--bust")):
+            (base + ["--no-bust", "--rounds", "1"], "--no-bust")):
         code, out, err = run(argv)
         check(code == 64 and out == "" and not os.path.exists(prefixed),
               "a prefix of a flag is refused, not read as the flag: " + why
@@ -1966,7 +1979,7 @@ def _assertions(tmp, passed, failed, stubs):
     check(dflt.timeout == 30.0 and dflt.min_image_bytes == 1000
           and dflt.max_requests == 2000 and dflt.interval == 10.0
           and dflt.faulty == "1/4" and dflt.max_miss == 0.01
-          and dflt.wait == 0.0 and not dflt.bust_cache,
+          and dflt.wait == 0.0 and not dflt.no_bust_cache,
           "the defaults in the README flag table are the defaults in the code")
     nl_stub = serve(pool(1, 0, random.Random(3)))
     for tail in ("\n", "\r\n"):
@@ -2047,15 +2060,19 @@ def _assertions(tmp, passed, failed, stubs):
           "a token echoed in the error code with JSON escapes is removed "
           "before the code is cut  <-- pinned defect")
     # argparse echoes the argument it refuses, and a token typed after the
-    # wrong flag or into a numeric flag is that argument.
+    # wrong flag or into a numeric flag is that argument. The environment may
+    # hold no token, so the value is dropped whether or not it is known.
     for argv in (["--token", "SECRETtok123"], ["--rounds=SECRETtok123"],
-                 ["--rounds", "SECRETtok123"]):
-        code, out, err = run([stub.url("/svc/MapServer")] + argv,
-                             token="SECRETtok123")
-        check(code == 64 and out == "" and "SECRETtok123" not in err
-              and "[token]" in err,
-              "a token typed after the wrong flag is not echoed in the "
-              "usage error: %s  <-- pinned defect" % argv[0].split("=")[0])
+                 ["--rounds", "SECRETtok123"], ["--apply=SECRETtok123"],
+                 ["--token=SECRETtok123"]):
+        for known in ("SECRETtok123", None):
+            code, out, err = run([stub.url("/svc/MapServer")] + argv,
+                                 token=known)
+            check(code == 64 and out == "" and "SECRETtok123" not in err
+                  and argv[0].split("=")[0] in err,
+                  "a secret typed after the wrong flag is not echoed in the "
+                  "usage error, %s a token set: %s  <-- pinned defect"
+                  % ("with" if known else "with no", argv[0].split("=")[0]))
     # Every other line main() prints from typed text goes through scrub too.
     tok = "SECRETtok9876543210" + "Q" * 50
     tiers_file = os.path.join(tmp, "leak_tiers.txt")
@@ -2070,14 +2087,30 @@ def _assertions(tmp, passed, failed, stubs):
                        "--out", os.path.join(tmp, tok, "x.csv"), "--apply"]),
             ("the port", ["http://127.0.0.1:" + tok + "/a/MapServer"])):
         code, out, err = run(argv, token=tok)
+        # A path is echoed, as the user typed it, so only the scrub hides it.
+        shows_path = label in ("--tiers", "--out")
         check(code in (2, 64) and tok[:12] not in out + err
-              and tok[-12:] not in out + err and "[token]" in err,
+              and tok[-12:] not in out + err
+              and ("[token]" in err) == shows_path,
               "a token typed into %s is not echoed in the error line  "
               "<-- pinned defect" % label)
+        if not shows_path:
+            code, out, err = run(argv)
+            check(code == 64 and tok[:12] not in out + err
+                  and tok[-12:] not in out + err,
+                  "a secret typed into %s is not echoed with no token set  "
+                  "<-- pinned defect" % label)
     check(scrub_body(b"a SECRET b token=xyz&q=1", "SECRET")
           == b"a [token] b token=[token]&q=1"
           and scrub_body(b"plain", None) == b"plain",
           "scrub_body removes the token value and any token= parameter")
+    quoted = "Ab\"cd'ef&gh+ij"
+    check(scrub('<a href="?token=%s">' % quoted, quoted)
+          == '<a href="?token=[token]">'
+          and scrub_body(('x token=%s y' % quoted).encode(), quoted)
+          == b"x token=[token] y",
+          "a token that holds a quote or an ampersand is removed whole, "
+          "not cut at that character  <-- pinned defect")
     kind, detail, status = judge(MAP_SERVER, Reply(
         302, "", b"", REDIRECT, "redirected to /x/" + "T" * 300), 1, "T" * 300)
     check(kind == REDIRECT and "TTTTTTTT" not in detail
@@ -2120,11 +2153,48 @@ def _assertions(tmp, passed, failed, stubs):
               describe([good], dict(ctx, bust=True))),
           "a PASS says when the repeated requests were not cache-busted"
           "  <-- pinned defect")
-    code, out, err = run([stub.url("/svc/MapServer"), "--rounds", "17",
-                          "--bust-cache"])
+    code, out, err = run([stub.url("/svc/MapServer"), "--rounds", "17"])
     check(code == 0 and "VERDICT: PASS" in out
-          and "Cache busting" not in out,
-          "a run with --bust-cache does not carry the cache note")
+          and "Cache busting" not in out
+          and any("_svcsmoke" in r[1] for r in stub.requests),
+          "a run busts the cache by default and carries no cache note"
+          "  <-- pinned defect")
+    code, out, err = run([stub.url("/svc/MapServer"), "--rounds", "17",
+                          "--no-bust-cache"])
+    check(code == 0 and "Cache busting was off" in out,
+          "--no-bust-cache turns the busting off and a PASS says so")
+    # A cache keyed on the URL answers every round of a probe from one stored
+    # reply, so 17 rounds are one draw. Busting makes them 17 draws.
+    for flags, expect in (([], 1), (["--no-bust-cache"], 0)):
+        stored = {}
+        inner = pool(8, 2, random.Random(33))
+
+        def cached(path, params, headers, stored=stored, inner=inner):
+            key = (path, tuple(sorted(params.items())))
+            if key not in stored:
+                stored[key] = inner(path, params, headers)
+            return stored[key]
+        cache_stub = serve(cached)
+        code, out, err = run([cache_stub.url("/svc/MapServer"), "--faulty",
+                              "2/8"] + flags)
+        check(code == expect,
+              "a cache in front of a pool with 2 of 8 bad is %s %s"
+              % ("caught" if expect else "passed with", "by default"
+                 if not flags else "when busting is off")
+              + ("  <-- pinned defect" if not flags else ""))
+    check(status_note(503, HTTP_STATUS) == "" and status_note(None, OK) == ""
+          and status_note(503, NOT_JSON) == " (HTTP 503, recorded only)",
+          "only a failure that the body decides is labelled 'recorded only'"
+          "  <-- pinned defect")
+    status_stub = serve(lambda path, params, headers: {"body": map_root()}
+                        if path.endswith("/MapServer")
+                        else {"body": GOOD, "status": 503})
+    code, out, err = run([status_stub.url("/svc/MapServer"), "--rounds", "2"])
+    check(code == 1 and "HTTP_STATUS x2" in out
+          and "HTTP 503 with a good body" in out
+          and "recorded only" not in out,
+          "a good body under HTTP 503 fails, and the line does not say the "
+          "status was only recorded  <-- pinned defect")
     code, calls, said = gate_of([1], 0.5, 1.0)
     check(code == 5 and len(calls) == 1,
           "a --wait shorter than --interval is one look, then exit 5")
@@ -2616,7 +2686,7 @@ def _assertions(tmp, passed, failed, stubs):
     ok_stub = serve(pool(1, 0, random.Random(3)))
     code, out, err = run([ok_stub.url("/svc/MapServer")])
     check(code == 0 and "Check only" not in out and "not written" not in out
-          and out.rstrip().endswith("could have answered repeated requests."),
+          and out.rstrip().endswith("It says nothing about a smaller share."),
           "a run without --out prints no 'not written' line  "
           "<-- pinned defect")
     code, out, err = run(["--before", "app"])
@@ -2729,8 +2799,9 @@ def _assertions(tmp, passed, failed, stubs):
     try:
         tiers_before(tiers, "nope")
     except ValueError as exc:
-        check(str(exc) == "no tier named 'nope'. The file has: db, app, web",
-              "an unknown tier is refused by name, with the tiers the file has")
+        check(str(exc) == "no tier has that name. The file has: db, app, web",
+              "an unknown tier is refused, with the tiers the file has, and "
+              "the name typed is not echoed")
     numbered = "\n".join(describe([good, bad], ctx))
     check("\n1. PASS " in "\n" + numbered and "\n2. FAIL " in numbered,
           "the report numbers its targets from 1")
@@ -2865,11 +2936,25 @@ def _assertions(tmp, passed, failed, stubs):
 
 # ----------------------------------------------------------------------- cli
 
+_FLAG_NAME = re.compile(r"--[A-Za-z][A-Za-z-]{0,23}$")
+_QUOTED = re.compile(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"")
+
+
 class _Parser(argparse.ArgumentParser):
-    """argparse echoes the offending argument in its message. A token typed
-    after the wrong flag must not reach stderr, so the message is scrubbed."""
+    """argparse echoes the offending argument in its message. A secret typed
+    after the wrong flag, or into a numeric flag, must not reach stderr, so
+    the message keeps flag names and drops every other typed value."""
 
     def error(self, message):
+        head, sep, rest = message.partition("unrecognized arguments: ")
+        if sep:
+            given = rest.split()
+            names = [a.split("=")[0] for a in given
+                     if _FLAG_NAME.match(a.split("=")[0])]
+            message = "%sunrecognized arguments: %s (%d value(s) not shown)" % (
+                head, " ".join(names), len(given) - len(names))
+        else:
+            message = _QUOTED.sub("(value not shown)", message)
         self.print_usage(sys.stderr)
         self.exit(2, "%s: error: %s\n" % (
             self.prog, scrub(message, _env_token())))
@@ -2916,9 +3001,11 @@ def _parse(argv):
                     default=DEFAULT_MIN_IMAGE_BYTES,
                     help="an image service export smaller than this counts as blank "
                          "(default %d)" % DEFAULT_MIN_IMAGE_BYTES)
-    ap.add_argument("--bust-cache", dest="bust_cache", action="store_true",
-                    help="add a different throwaway parameter to each round, "
-                         "so a cache keyed on the URL cannot answer")
+    ap.add_argument("--no-bust-cache", dest="no_bust_cache",
+                    action="store_true",
+                    help="do not add a different throwaway parameter to each "
+                         "round. Without it a cache keyed on the URL can "
+                         "answer every round, and a PASS says so.")
     ap.add_argument("--max-requests", dest="max_requests", type=int,
                     default=DEFAULT_MAX_REQUESTS,
                     help="refuse a plan larger than this (default %d)"
@@ -2948,8 +3035,8 @@ def _layer_ids(text):
     for piece in text.split(","):
         piece = piece.strip()
         if not piece.isdigit():
-            raise ValueError("--layers must be comma-separated layer ids, not "
-                             "%r" % tidy(scrub(text, _env_token()), 40))
+            raise ValueError("--layers must be comma-separated layer ids "
+                             "such as 0,3")
         if int(piece) not in ids:
             ids.append(int(piece))
     return ids
@@ -3074,12 +3161,12 @@ def _run(argv):
 
     rounds = args.rounds or needed
     options = {"rounds": rounds, "needed": needed, "layers": layers,
-               "bust": args.bust_cache, "min_bytes": args.min_image_bytes,
+               "bust": not args.no_bust_cache, "min_bytes": args.min_image_bytes,
                "max_requests": args.max_requests, "token": token,
                "resources": args.layer_resources}
     context = {"rounds": rounds, "needed": needed, "fraction": fraction,
                "faulty": args.faulty.replace(" ", ""),
-               "max_miss": args.max_miss, "bust": args.bust_cache,
+               "max_miss": args.max_miss, "bust": not args.no_bust_cache,
                "rounds_note": (" (set by --rounds)" if args.rounds else
                                " (the fewest that meet --max-miss)")}
     fetch = make_fetcher(token, args.timeout)
